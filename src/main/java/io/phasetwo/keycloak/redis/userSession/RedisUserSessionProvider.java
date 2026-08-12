@@ -352,22 +352,51 @@ public class RedisUserSessionProvider implements UserSessionProvider {
   public Stream<UserSessionModel> getUserSessionsStream(RealmModel realm, ClientModel client) {
     log.tracef("getUserSessionsStream(%s, %s)%s", realm, client, getShortStackTrace());
 
+    return getClientSessionsByClientIndex(realm, client)
+        .map(RedisAuthenticatedClientSessionAdapter::getUserSession)
+        .filter(Objects::nonNull)
+        .filter(us -> !us.isOffline());
+  }
+
+  /**
+   * Reads the authenticated-client:client-index Set for a client and resolves its members to live
+   * client-session adapters (matching realm and client). In cluster mode this eagerly resolves so
+   * that dangling members — whose client-session hash has expired/vanished — are reconciled
+   * ({@code SREM}'d) out of the Set, making the by-client reads self-healing (issue #78). In
+   * standalone/sentinel the original lazy resolution is kept unchanged. Members are read in a stable
+   * (sorted) order in both modes, preserving pagination consistency for callers.
+   */
+  private Stream<RedisAuthenticatedClientSessionAdapter> getClientSessionsByClientIndex(
+      RealmModel realm, ClientModel client) {
     String indexKey = String.format("authenticated-client:client-index:%s", client.getId());
     log.tracef("[redis] SMEMBERS %s", indexKey);
     Set<String> strIds = Sets.newTreeSet(jedis.smembers(indexKey)); // for consistent sorting
-    if (!strIds.isEmpty()) {
-      return strIds.stream()
-          .map(AuthenticatedClientSessionKey::fromString)
-          .map(clientSessionTrx::getIfPresent)
-          .filter(Objects::nonNull)
-          .filter(c -> c.getRealmId().equals(realm.getId()))
-          .filter(c -> c.getClientUuid().equals(client.getId()))
-          .map(RedisAuthenticatedClientSessionAdapter::getUserSession)
-          .filter(Objects::nonNull)
-          .filter(us -> !us.isOffline());
-    } else {
+    if (strIds.isEmpty()) {
       return Stream.empty();
     }
+    if (redisMode == RedisMode.CLUSTER) {
+      List<RedisAuthenticatedClientSessionAdapter> live = Lists.newArrayList();
+      List<String> dead = Lists.newArrayList();
+      for (String strId : strIds) {
+        RedisAuthenticatedClientSessionAdapter entity =
+            clientSessionTrx.getIfPresent(AuthenticatedClientSessionKey.fromString(strId));
+        if (entity == null) {
+          dead.add(strId);
+        } else {
+          live.add(entity);
+        }
+      }
+      reconcileStaleIndexMembers(new String[] {indexKey}, dead);
+      return live.stream()
+          .filter(c -> c.getRealmId().equals(realm.getId()))
+          .filter(c -> c.getClientUuid().equals(client.getId()));
+    }
+    return strIds.stream()
+        .map(AuthenticatedClientSessionKey::fromString)
+        .map(clientSessionTrx::getIfPresent)
+        .filter(Objects::nonNull)
+        .filter(c -> c.getRealmId().equals(realm.getId()))
+        .filter(c -> c.getClientUuid().equals(client.getId()));
   }
 
   // xx
@@ -694,21 +723,10 @@ public class RedisUserSessionProvider implements UserSessionProvider {
   public long getOfflineSessionsCount(RealmModel realm, ClientModel client) {
     log.tracef("getOfflineSessionsCount(%s, %s)%s", realm, client, getShortStackTrace());
 
-    String indexKey = String.format("authenticated-client:client-index:%s", client.getId());
-    log.tracef("[redis] SMEMBERS %s", indexKey);
-    Set<String> strIds = Sets.newTreeSet(jedis.smembers(indexKey)); // for consistent sorting
-    if (!strIds.isEmpty()) {
-      return strIds.stream()
-          .map(AuthenticatedClientSessionKey::fromString)
-          .map(clientSessionTrx::getIfPresent)
-          .filter(Objects::nonNull)
-          .filter(c -> c.getRealmId().equals(realm.getId()))
-          .filter(c -> c.getClientUuid().equals(client.getId()))
-          .map(RedisAuthenticatedClientSessionAdapter::getUserSession)
-          .filter(UserSessionModel::isOffline)
-          .count();
-    }
-    return 0;
+    return getClientSessionsByClientIndex(realm, client)
+        .map(RedisAuthenticatedClientSessionAdapter::getUserSession)
+        .filter(UserSessionModel::isOffline)
+        .count();
   }
 
   // xx
@@ -719,24 +737,12 @@ public class RedisUserSessionProvider implements UserSessionProvider {
         "getOfflineUserSessionsStream(%s, %s, %s, %s)%s",
         realm, client, firstResult, maxResults, getShortStackTrace());
 
-    String indexKey = String.format("authenticated-client:client-index:%s", client.getId());
-    log.tracef("[redis] SMEMBERS %s", indexKey);
-    Set<String> strIds = Sets.newTreeSet(jedis.smembers(indexKey)); // for consistent sorting
-    if (!strIds.isEmpty()) {
-      return strIds.stream()
-          .map(AuthenticatedClientSessionKey::fromString)
-          .map(clientSessionTrx::getIfPresent)
-          .filter(Objects::nonNull)
-          .filter(c -> c.getRealmId().equals(realm.getId()))
-          .filter(c -> c.getClientUuid().equals(client.getId()))
-          .map(RedisAuthenticatedClientSessionAdapter::getUserSession)
-          .filter(Objects::nonNull)
-          .filter(UserSessionModel::isOffline)
-          .skip(firstResult != null && firstResult > 0 ? firstResult : 0)
-          .limit(maxResults != null && maxResults > 0 ? maxResults : Long.MAX_VALUE);
-    } else {
-      return Stream.empty();
-    }
+    return getClientSessionsByClientIndex(realm, client)
+        .map(RedisAuthenticatedClientSessionAdapter::getUserSession)
+        .filter(Objects::nonNull)
+        .filter(UserSessionModel::isOffline)
+        .skip(firstResult != null && firstResult > 0 ? firstResult : 0)
+        .limit(maxResults != null && maxResults > 0 ? maxResults : Long.MAX_VALUE);
   }
 
   @SuppressWarnings("removal")

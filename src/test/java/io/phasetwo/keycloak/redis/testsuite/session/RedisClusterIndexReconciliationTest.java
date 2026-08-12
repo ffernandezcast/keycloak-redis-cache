@@ -21,6 +21,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.notNullValue;
 
 import io.phasetwo.keycloak.redis.connection.RedisMode;
 import io.phasetwo.keycloak.redis.testsuite.KeycloakModelTest;
@@ -30,6 +31,8 @@ import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.keycloak.models.AuthenticatedClientSessionModel;
+import org.keycloak.models.ClientModel;
 import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
@@ -202,5 +205,82 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
         "index TTL must not shrink below a longer-lived member (GT); was " + after,
         after > twentyFiveDaysMs,
         is(true));
+  }
+
+  /** A syntactically-valid client-session index member that resolves to no entity (dangling). */
+  private static String danglingClientSessionMember() {
+    return "authenticated-client:" + java.util.UUID.randomUUID();
+  }
+
+  /**
+   * A stale <b>client-index</b> member (whose client-session hash is gone) is reconciled out of the
+   * Set when sessions are read by client via {@code getUserSessionsStream(realm, client)}.
+   *
+   * <p>RED (before the fix): the read returns nothing but leaves the dead member in the client-index
+   * Set. GREEN: the read {@code SREM}s it.
+   */
+  @Test
+  public void testStaleClientIndexMemberReconciledOnRead() {
+    String clientUuid =
+        withRealm(realmId, (s, realm) -> realm.getClientByClientId("test-app").getId());
+    String indexKey = ClusterTestSupport.clientIndexKey(clientUuid);
+
+    // Seed a dangling client-index member pointing at a non-existent client-session hash.
+    clusterJedis.sadd(indexKey, danglingClientSessionMember());
+    assertThat(ClusterTestSupport.members(clusterJedis, indexKey), hasSize(1));
+
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          ClientModel client = realm.getClientByClientId("test-app");
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, clusterJedis, RedisMode.CLUSTER);
+          assertThat(provider.getUserSessionsStream(realm, client).count(), is(0L));
+          return null;
+        });
+
+    assertThat(ClusterTestSupport.members(clusterJedis, indexKey), is(empty()));
+  }
+
+  /**
+   * A stale <b>parent-index</b> member (whose client-session hash is gone) is reconciled out of the
+   * Set when a user session enumerates its client sessions via {@code
+   * UserSessionModel.getAuthenticatedClientSessions()} (in the adapter).
+   *
+   * <p>RED (before the fix): enumeration returns nothing but leaves the dead member in the
+   * parent-index Set. GREEN: it {@code SREM}s it.
+   */
+  @Test
+  public void testStaleParentIndexMemberReconciledOnRead() {
+    // A real user session to enumerate client sessions on.
+    String userSessionId =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              UserModel user = s.users().getUserByUsername(realm, "user1");
+              RedisUserSessionProvider provider =
+                  new RedisUserSessionProvider(s, clusterJedis, RedisMode.CLUSTER);
+              return provider
+                  .createUserSession(realm, user, "user1", "127.0.0.1", "form", true, null, null)
+                  .getId();
+            });
+    String indexKey = ClusterTestSupport.parentIndexKey(userSessionId);
+
+    // Seed a dangling parent-index member pointing at a non-existent client-session hash.
+    clusterJedis.sadd(indexKey, danglingClientSessionMember());
+    assertThat(ClusterTestSupport.members(clusterJedis, indexKey), hasSize(1));
+
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, clusterJedis, RedisMode.CLUSTER);
+          UserSessionModel userSession = provider.getUserSession(realm, userSessionId);
+          assertThat(userSession, notNullValue());
+          assertThat(userSession.getAuthenticatedClientSessions().size(), is(0));
+          return null;
+        });
+
+    assertThat(ClusterTestSupport.members(clusterJedis, indexKey), is(empty()));
   }
 }

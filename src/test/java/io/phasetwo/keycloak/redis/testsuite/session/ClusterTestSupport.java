@@ -161,6 +161,16 @@ public final class ClusterTestSupport {
     return "user-session:user-index:" + userId;
   }
 
+  /** The client-index Set key for a client uuid (members = authenticated-client entity keys). */
+  public static String clientIndexKey(String clientUuid) {
+    return "authenticated-client:client-index:" + clientUuid;
+  }
+
+  /** The parent-index Set key for a user-session id (members = authenticated-client entity keys). */
+  public static String parentIndexKey(String userSessionId) {
+    return "authenticated-client:parent-index:" + userSessionId;
+  }
+
   /** Members currently held by an index Set (never null; empty if the Set is absent). */
   public static Set<String> members(UnifiedJedis jedis, String indexKey) {
     Set<String> m = jedis.smembers(indexKey);

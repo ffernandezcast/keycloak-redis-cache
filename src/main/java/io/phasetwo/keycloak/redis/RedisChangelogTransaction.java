@@ -52,6 +52,11 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
     this(cacheName, jedis, RedisMode.STANDALONE, adapterSupplier);
   }
 
+  /** The Redis deployment mode this transaction writes for. */
+  public RedisMode getRedisMode() {
+    return redisMode;
+  }
+
   /** Count an operation in metrics */
   void countOperation(String op) {
     List<Tag> tags = Lists.newArrayList();
