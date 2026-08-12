@@ -21,29 +21,18 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.hasSize;
 
-import io.phasetwo.keycloak.redis.RedisHashCas;
 import io.phasetwo.keycloak.redis.connection.RedisMode;
 import io.phasetwo.keycloak.redis.testsuite.KeycloakModelTest;
 import io.phasetwo.keycloak.redis.userSession.RedisUserSessionProvider;
-import java.net.ServerSocket;
 import java.util.List;
-import java.util.Set;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
-import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.keycloak.models.Constants;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.models.UserSessionModel;
-import org.testcontainers.containers.Container;
-import org.testcontainers.containers.FixedHostPortGenericContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import redis.clients.jedis.DefaultJedisClientConfig;
-import redis.clients.jedis.HostAndPort;
-import redis.clients.jedis.JedisClientConfig;
-import redis.clients.jedis.RedisClusterClient;
 import redis.clients.jedis.UnifiedJedis;
 
 /**
@@ -79,90 +68,22 @@ import redis.clients.jedis.UnifiedJedis;
 @SuppressWarnings("deprecation")
 public class RedisClusterUserSessionProviderModelTest extends KeycloakModelTest {
 
-  private static FixedHostPortGenericContainer<?> clusterContainer;
+  private static ClusterTestSupport.Handle cluster;
   private static UnifiedJedis clusterJedis;
 
   private String realmId;
 
   @BeforeClass
   public static void startCluster() throws Exception {
-    int port = findFreePort();
-
-    clusterContainer =
-        new FixedHostPortGenericContainer<>("valkey/valkey:8.1.5")
-            .withFixedExposedPort(port, 6379)
-            .withCommand(
-                "valkey-server",
-                "--port",
-                "6379",
-                "--cluster-enabled",
-                "yes",
-                "--cluster-node-timeout",
-                "5000",
-                "--appendonly",
-                "no",
-                "--protected-mode",
-                "no",
-                "--cluster-announce-ip",
-                "127.0.0.1",
-                "--cluster-announce-port",
-                String.valueOf(port))
-            .waitingFor(Wait.forLogMessage(".*Ready to accept connections.*", 1));
-    clusterContainer.start();
-
-    // Assign every hash slot to the single node so the cluster reaches the 'ok' state.
-    clusterContainer.execInContainer("valkey-cli", "cluster", "addslotsrange", "0", "16383");
-
-    // Wait for the cluster to report a healthy state before connecting.
-    boolean ready = false;
-    for (int i = 0; i < 40 && !ready; i++) {
-      Container.ExecResult info = clusterContainer.execInContainer("valkey-cli", "cluster", "info");
-      ready = info.getStdout().contains("cluster_state:ok");
-      if (!ready) {
-        Thread.sleep(500);
-      }
-    }
-    if (!ready) {
-      throw new IllegalStateException("Valkey cluster did not reach state 'ok' in time");
-    }
-
-    JedisClientConfig clientConfig =
-        DefaultJedisClientConfig.builder()
-            .connectionTimeoutMillis(5000)
-            .socketTimeoutMillis(5000)
-            .build();
-    clusterJedis =
-        RedisClusterClient.builder()
-            .nodes(Set.of(new HostAndPort("127.0.0.1", port)))
-            .clientConfig(clientConfig)
-            .build();
-
-    // Sanity check: topology is discovered and pipelining yields a genuine ClusterPipeline.
-    Assert.assertTrue(
-        "Expected a cluster-mode client whose pipeline is a ClusterPipeline",
-        clusterJedis.pipelined() instanceof redis.clients.jedis.ClusterPipeline);
-
-    // Load the CAS Lua script onto the cluster node used by the provider's write path.
-    RedisHashCas.initialize(clusterJedis);
-  }
-
-  private static int findFreePort() throws Exception {
-    try (ServerSocket socket = new ServerSocket(0)) {
-      socket.setReuseAddress(true);
-      return socket.getLocalPort();
-    }
+    cluster = ClusterTestSupport.start();
+    clusterJedis = cluster.jedis;
   }
 
   @AfterClass
   public static void stopCluster() {
-    if (clusterJedis != null) {
-      clusterJedis.close();
-      clusterJedis = null;
-    }
-    if (clusterContainer != null) {
-      clusterContainer.stop();
-      clusterContainer = null;
-    }
+    ClusterTestSupport.stop(cluster);
+    cluster = null;
+    clusterJedis = null;
   }
 
   @Override
