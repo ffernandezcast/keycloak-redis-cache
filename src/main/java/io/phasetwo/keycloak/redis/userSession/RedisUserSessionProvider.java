@@ -30,6 +30,7 @@ import redis.clients.jedis.UnifiedJedis;
 public class RedisUserSessionProvider implements UserSessionProvider {
   private final KeycloakSession session;
   private final UnifiedJedis jedis;
+  private final RedisMode redisMode;
 
   private final RedisChangelogTransaction<UserSessionKey, RedisUserSessionAdapter> userSessionTrx;
   private final RedisChangelogTransaction<
@@ -47,6 +48,7 @@ public class RedisUserSessionProvider implements UserSessionProvider {
       KeycloakSession session, UnifiedJedis jedis, RedisMode redisMode) {
     this.session = session;
     this.jedis = jedis;
+    this.redisMode = redisMode;
 
     this.clientSessionTrx =
         new RedisChangelogTransaction<>(
@@ -279,6 +281,27 @@ public class RedisUserSessionProvider implements UserSessionProvider {
               .collect(Collectors.toSet());
 
       if (!strIds.isEmpty()) {
+        if (redisMode == RedisMode.CLUSTER) {
+          // Cluster mode: eagerly resolve so stale (dangling) index members — whose session hash
+          // has TTL-expired/vanished — can be reconciled (SREM'd) out of the index Set, making
+          // by-index reads self-healing instead of letting the Sets grow unbounded (issue #78).
+          // Gated to cluster; standalone/sentinel keep the untouched lazy stream below.
+          List<RedisUserSessionAdapter> live = Lists.newArrayList();
+          List<String> dead = Lists.newArrayList();
+          for (String strId : strIds) {
+            RedisUserSessionAdapter entity =
+                userSessionTrx.getIfPresent(UserSessionKey.fromString(strId));
+            if (entity == null) {
+              dead.add(strId);
+            } else {
+              live.add(entity);
+            }
+          }
+          reconcileStaleIndexMembers(indexKeys, dead);
+          return live.stream()
+              .filter(s -> s.getRealmId().equals(realm.getId()))
+              .filter(s -> offline == s.isOffline());
+        }
         return strIds.stream()
             .map(UserSessionKey::fromString)
             .map(userSessionTrx::getIfPresent)
@@ -291,6 +314,28 @@ public class RedisUserSessionProvider implements UserSessionProvider {
     }
 
     return Stream.empty();
+  }
+
+  /**
+   * Cluster-mode only: remove index members that resolved to no entity (their session hash has
+   * expired/vanished) from each index Set they were read from, so the by-index Sets self-heal on
+   * read instead of growing unbounded. No-op in standalone/sentinel, where the delete path keeps
+   * indexes consistent via a MULTI/EXEC transaction. Best-effort (fail-open): a reconciliation
+   * failure never breaks the read. See issue #78.
+   */
+  private void reconcileStaleIndexMembers(String[] indexKeys, List<String> deadMembers) {
+    if (redisMode != RedisMode.CLUSTER || deadMembers.isEmpty()) {
+      return;
+    }
+    String[] members = deadMembers.toArray(new String[0]);
+    for (String indexKey : indexKeys) {
+      try {
+        log.tracef("[redis] SREM %s %s (stale index reconciliation)", indexKey, deadMembers);
+        jedis.srem(indexKey, members);
+      } catch (Exception e) {
+        log.warnf(e, "Failed to reconcile stale members from index %s", indexKey);
+      }
+    }
   }
 
   // xx
