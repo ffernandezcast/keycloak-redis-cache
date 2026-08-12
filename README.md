@@ -91,6 +91,19 @@ A pre-built docker image is also available at (https://quay.io/repository/phaset
 - ~~You should probably enable sticky sessions on your load balancer, although we need to substantiate this with testing.~~
 - Our CAS retry behavior is naive, rebasing the entity on version mismatch. This rebase is field-level, not operation-level. It preserves partial note/map edits, but it does not recreate logical operations like “increment from latest value” for things such as incrementFailures(). We should look at how the Keycloak [`Updater`](https://www.keycloak.org/docs-api/latest/javadocs/org/keycloak/models/sessions/infinispan/changes/remote/updater/Updater.html) works, and do something similar in a per-entity Lua function.
 
+### Cluster mode consistency
+
+Session entities (`user-session:*`, `authenticated-client:*`) are hashes, and each is referenced by one or more **secondary-index Sets** (`user-session:user-index:*`, `authenticated-client:client-index:*`, `…:parent-index:*`, broker indexes, etc.). A session belongs to several indexes at once, and in Redis Cluster those keys hash to different slots — so a single `MULTI`/`EXEC` (or Lua) touching a session hash **and** all its index members is impossible (it would raise `CROSSSLOT`), and hash tags cannot co-locate an index with every member it fans in to. Full multi-key atomicity is therefore unavailable in cluster mode.
+
+Rather than fight this, cluster mode adopts the **same eventual-consistency contract Keycloak's own Infinispan caches already provide**. The index Sets are treated as a self-healing hint, not a source of truth:
+
+- **Entity-before-index on write, index-after-delete.** The session hash is written (single-key CAS, cluster-safe) before its index members are added; on delete the hash is removed before the members. A reader may briefly see an index member whose entity is not yet visible, or vice-versa — never a corrupt entity.
+- **Reads drop dangling members and self-reconcile.** A by-index lookup ignores members whose entity has expired/vanished (they are filtered from the result), and in cluster mode it also `SREM`s them from the Set it read — so reads act as the garbage collector for stale index entries.
+- **TTL backstop on index Sets.** Because a session hash can expire via native TTL without going through the delete path, cluster-mode writes also give each index Set a TTL derived from the referencing session's expiration, applied grow-only (`PEXPIREAT … GT`, established with `NX`) so the Set always outlives its longest-lived member. This bounds index growth even for Sets that reads never revisit.
+- **Bulk operations (session-limit enforcement, logout-all) are eventual and fail-open** in cluster mode, as they already are in every mode.
+
+All of the above is gated to cluster mode: **standalone and sentinel keep their atomic `MULTI`/`EXEC` index maintenance and set no index TTLs** — verified by `RedisIndexModeIsolationTest`, and the reconciliation behavior by `RedisClusterIndexReconciliationTest`.
+
 ## Support
 
 If you have been testing this and found an issue, please file an [issue](https://github.com/p2-inc/keycloak-redis-cache/issues) and a [pull request](https://github.com/p2-inc/keycloak-redis-cache/pulls) if you are able to identify and remediate the bug.
