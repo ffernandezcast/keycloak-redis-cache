@@ -20,6 +20,7 @@ import redis.clients.jedis.AbstractPipeline;
 import redis.clients.jedis.AbstractTransaction;
 import redis.clients.jedis.Response;
 import redis.clients.jedis.UnifiedJedis;
+import redis.clients.jedis.args.ExpiryOption;
 
 @JBossLog
 public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
@@ -287,10 +288,28 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
         txn.exec();
       }
     } else {
+      // Cluster mode: a MULTI/EXEC across the index Set and the entity key is impossible (they
+      // hash to different slots), so each SADD is issued individually. Additionally give every
+      // index Set a TTL backstop so dangling members cannot accumulate unbounded when a session
+      // hash TTL-expires without going through the delete path (issue #78). GT (grow-only) ensures
+      // a write never shortens a TTL that already covers a longer-lived member of the same Set.
+      Long expireAtMs = null;
+      if (model instanceof ExpirableEntity) {
+        expireAtMs = ((ExpirableEntity) model).getExpiration();
+      }
       for (Map.Entry<String, String> index : validIndexes) {
         log.tracef("[redis] SADD %s %s", index.getKey(), index.getValue());
         jedis.sadd(index.getKey(), index.getValue());
         countOperation(SADD);
+        if (expireAtMs != null && expireAtMs > 0L) {
+          // Establish a TTL if the Set has none (NX), then only ever extend it (GT). Redis treats
+          // a key with no TTL as +infinity, so GT alone would never set the initial TTL on a
+          // freshly-created Set; NX handles the first write, GT keeps later writes grow-only so a
+          // shorter-lived session can't shrink a TTL already covering a longer-lived member.
+          log.tracef("[redis] PEXPIREAT %s %s NX/GT", index.getKey(), expireAtMs);
+          jedis.pexpireAt(index.getKey(), expireAtMs, ExpiryOption.NX);
+          jedis.pexpireAt(index.getKey(), expireAtMs, ExpiryOption.GT);
+        }
       }
     }
   }

@@ -106,20 +106,25 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
    * Set, so the final {@code SMEMBERS} assertion fails. GREEN: the read {@code SREM}s the dead
    * member and the Set is empty.
    */
+  /**
+   * Creates one user session for {@code user1} through a real cluster-mode provider (SADDs into the
+   * user-index on transaction commit) and returns that user's id.
+   */
+  private String createUserSessionReturningUserId() {
+    return withRealm(
+        realmId,
+        (s, realm) -> {
+          UserModel user = s.users().getUserByUsername(realm, "user1");
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, clusterJedis, RedisMode.CLUSTER);
+          provider.createUserSession(realm, user, "user1", "127.0.0.1", "form", true, null, null);
+          return user.getId();
+        });
+  }
+
   @Test
   public void testStaleUserIndexMemberReconciledOnRead() {
-    // Create a user session through a real cluster-mode provider; SADDs into user-index on commit.
-    String userId =
-        withRealm(
-            realmId,
-            (s, realm) -> {
-              UserModel user = s.users().getUserByUsername(realm, "user1");
-              RedisUserSessionProvider provider =
-                  new RedisUserSessionProvider(s, clusterJedis, RedisMode.CLUSTER);
-              provider.createUserSession(
-                  realm, user, "user1", "127.0.0.1", "form", true, null, null);
-              return user.getId();
-            });
+    String userId = createUserSessionReturningUserId();
 
     String indexKey = ClusterTestSupport.userIndexKey(userId);
 
@@ -149,5 +154,53 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
 
     // The dead member must have been reconciled (SREM'd) out of the index Set during the read.
     assertThat(ClusterTestSupport.members(clusterJedis, indexKey), is(empty()));
+  }
+
+  /**
+   * Every index Set written in cluster mode carries a positive TTL backstop, so members can never
+   * outlive the sessions that reference them even if a read never revisits the Set.
+   *
+   * <p>RED (before the fix): the write path issues only {@code SADD}, so {@code PTTL} is {@code -1}
+   * (no expiry) and this fails. GREEN: {@code PEXPIREAT ... GT} gives the Set a positive TTL.
+   */
+  @Test
+  public void testUserIndexHasTtlBackstopInCluster() {
+    String userId = createUserSessionReturningUserId();
+    String indexKey = ClusterTestSupport.userIndexKey(userId);
+
+    assertThat(ClusterTestSupport.members(clusterJedis, indexKey), hasSize(1));
+
+    long pttl = ClusterTestSupport.pttl(clusterJedis, indexKey);
+    assertThat(
+        "index Set must carry a positive TTL backstop in cluster mode (was " + pttl + ")",
+        pttl > 0L,
+        is(true));
+  }
+
+  /**
+   * The TTL backstop is <b>grow-only</b>: because one index Set aggregates many sessions with
+   * different expiries, a later write must never shorten a TTL that already covers a longer-lived
+   * member. This guards the {@code GT} flag — a naive unconditional {@code PEXPIREAT} would shrink
+   * the TTL to the newest session's (shorter) expiration and fail here.
+   */
+  @Test
+  public void testIndexTtlBackstopIsGrowOnlyInCluster() {
+    String userId = createUserSessionReturningUserId();
+    String indexKey = ClusterTestSupport.userIndexKey(userId);
+
+    // Force a far-future TTL (+30d), larger than any session lifespan in this realm.
+    long farFutureMs = System.currentTimeMillis() + 30L * 24 * 60 * 60 * 1000;
+    clusterJedis.pexpireAt(indexKey, farFutureMs);
+    assertThat(ClusterTestSupport.pttl(clusterJedis, indexKey) > 0L, is(true));
+
+    // A second session for the same user: its (much shorter) expiration must NOT shrink the TTL.
+    createUserSessionReturningUserId();
+
+    long after = ClusterTestSupport.pttl(clusterJedis, indexKey);
+    long twentyFiveDaysMs = 25L * 24 * 60 * 60 * 1000;
+    assertThat(
+        "index TTL must not shrink below a longer-lived member (GT); was " + after,
+        after > twentyFiveDaysMs,
+        is(true));
   }
 }
