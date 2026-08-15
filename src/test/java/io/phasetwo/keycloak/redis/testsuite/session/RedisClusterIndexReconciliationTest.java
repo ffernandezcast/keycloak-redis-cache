@@ -31,7 +31,6 @@ import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.keycloak.models.AuthenticatedClientSessionModel;
 import org.keycloak.models.ClientModel;
 import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
@@ -50,9 +49,11 @@ import redis.clients.jedis.UnifiedJedis;
  * cluster mode (where the delete path cannot use a MULTI/EXEC across slots).
  *
  * <p>The feature makes reads <em>self-reconciling</em>: when a by-index lookup encounters a member
- * that resolves to no entity, it {@code SREM}s that member from the Set it was read from. This is
- * gated to {@link RedisMode#CLUSTER} — standalone/sentinel behavior is unchanged and proven so by
- * {@code RedisIndexModeIsolationTest}.
+ * that resolves to no entity, it registers that member to be {@code SREM}'d from the Set it was
+ * read from when the transaction commits (never on the read path itself). Reconciliation runs in
+ * every mode; the all-mode / deferred-reap behavior is covered by {@code
+ * RedisIndexBackstopAllModesTest}. These tests verify the cluster wiring end-to-end, where the reap
+ * is issued per-key because a cross-slot MULTI is impossible.
  *
  * <p>Runs against a real cluster-mode Jedis client via {@link ClusterTestSupport}.
  */
@@ -139,7 +140,7 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
     assertThat(expired, is(1));
     assertThat(ClusterTestSupport.members(clusterJedis, indexKey), hasSize(1));
 
-    // Read by user: returns nothing (member resolves to no entity) AND self-heals the index.
+    // Read by user: returns nothing (member resolves to no entity) AND schedules the self-heal.
     withRealm(
         realmId,
         (s, realm) -> {
@@ -155,7 +156,8 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
           return null;
         });
 
-    // The dead member must have been reconciled (SREM'd) out of the index Set during the read.
+    // The dead member must have been reconciled (SREM'd) out of the index Set at transaction
+    // commit.
     assertThat(ClusterTestSupport.members(clusterJedis, indexKey), is(empty()));
   }
 
@@ -207,6 +209,37 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
         is(true));
   }
 
+  /**
+   * In cluster mode too, a member registered as dangling on read but re-created before the
+   * transaction commits must NOT be reaped (the commit-time re-verify runs over a ClusterPipeline).
+   */
+  @Test
+  public void doesNotReapMemberThatReappearedBeforeCommitInCluster() {
+    String userId = createUserSessionReturningUserId();
+    String indexKey = ClusterTestSupport.userIndexKey(userId);
+    String member = ClusterTestSupport.members(clusterJedis, indexKey).iterator().next();
+
+    // Plant a dangling member: session hash gone, index member left behind.
+    assertThat(ClusterTestSupport.expireIndexedEntities(clusterJedis, indexKey), is(1));
+
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          UserModel user = s.users().getUserByUsername(realm, "user1");
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, clusterJedis, RedisMode.CLUSTER);
+          assertThat(provider.getUserSessionsStream(realm, user).count(), is(0L));
+          // Concurrent recreate before commit: the same member key returns.
+          clusterJedis.hset(member, "id", "resurrected");
+          return null;
+        });
+
+    assertThat(
+        "a reaped member that reappeared before commit must survive in cluster mode",
+        ClusterTestSupport.members(clusterJedis, indexKey),
+        hasSize(1));
+  }
+
   /** A syntactically-valid client-session index member that resolves to no entity (dangling). */
   private static String danglingClientSessionMember() {
     return "authenticated-client:" + java.util.UUID.randomUUID();
@@ -216,8 +249,8 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
    * A stale <b>client-index</b> member (whose client-session hash is gone) is reconciled out of the
    * Set when sessions are read by client via {@code getUserSessionsStream(realm, client)}.
    *
-   * <p>RED (before the fix): the read returns nothing but leaves the dead member in the client-index
-   * Set. GREEN: the read {@code SREM}s it.
+   * <p>RED (before the fix): the read returns nothing but leaves the dead member in the
+   * client-index Set. GREEN: the read schedules it for reap and it is {@code SREM}'d at commit.
    */
   @Test
   public void testStaleClientIndexMemberReconciledOnRead() {
@@ -248,7 +281,7 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
    * UserSessionModel.getAuthenticatedClientSessions()} (in the adapter).
    *
    * <p>RED (before the fix): enumeration returns nothing but leaves the dead member in the
-   * parent-index Set. GREEN: it {@code SREM}s it.
+   * parent-index Set. GREEN: enumeration schedules it for reap and it is {@code SREM}'d at commit.
    */
   @Test
   public void testStaleParentIndexMemberReconciledOnRead() {

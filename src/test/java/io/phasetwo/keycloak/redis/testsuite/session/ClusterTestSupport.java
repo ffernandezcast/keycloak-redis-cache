@@ -38,9 +38,9 @@ import redis.clients.jedis.UnifiedJedis;
  * container bring-up rather than copying it. The strategy is unchanged: run a <em>single</em>
  * Valkey node with {@code --cluster-enabled yes}, bind it to a known fixed host port, announce that
  * exact port, and assign all 16384 slots to it, so {@code CLUSTER SLOTS} advertises a reachable
- * address and there are no cross-node MOVED redirects. A single-node cluster is still enough to make
- * {@code UnifiedJedis.pipelined()} return a {@code ClusterPipeline}, which is all cluster-mode code
- * paths require.
+ * address and there are no cross-node MOVED redirects. A single-node cluster is still enough to
+ * make {@code UnifiedJedis.pipelined()} return a {@code ClusterPipeline}, which is all cluster-mode
+ * code paths require.
  *
  * <p>Also provides index-inspection helpers. Because every secondary-index Set stores each member
  * as the referenced entity's own Redis key, {@link #expireIndexedEntities} can simulate TTL-expiry
@@ -51,7 +51,9 @@ public final class ClusterTestSupport {
 
   private ClusterTestSupport() {}
 
-  /** A running single-node cluster: its container, a connected cluster client, and the host port. */
+  /**
+   * A running single-node cluster: its container, a connected cluster client, and the host port.
+   */
   public static final class Handle {
     public final FixedHostPortGenericContainer<?> container;
     public final UnifiedJedis jedis;
@@ -166,7 +168,9 @@ public final class ClusterTestSupport {
     return "authenticated-client:client-index:" + clientUuid;
   }
 
-  /** The parent-index Set key for a user-session id (members = authenticated-client entity keys). */
+  /**
+   * The parent-index Set key for a user-session id (members = authenticated-client entity keys).
+   */
   public static String parentIndexKey(String userSessionId) {
     return "authenticated-client:parent-index:" + userSessionId;
   }
@@ -189,9 +193,10 @@ public final class ClusterTestSupport {
    */
   public static int expireIndexedEntities(UnifiedJedis jedis, String indexKey) {
     Set<String> members = members(jedis, indexKey);
+    long deleted = 0L;
     for (String memberKey : members) {
-      jedis.del(memberKey);
+      deleted += jedis.del(memberKey);
     }
-    return members.size();
+    return (int) deleted;
   }
 }

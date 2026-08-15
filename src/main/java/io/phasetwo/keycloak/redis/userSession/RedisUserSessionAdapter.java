@@ -10,15 +10,12 @@ import com.google.common.collect.Sets;
 import io.phasetwo.keycloak.common.ExpirableEntity;
 import io.phasetwo.keycloak.redis.MapEntity;
 import io.phasetwo.keycloak.redis.RedisChangelogTransaction;
-import io.phasetwo.keycloak.redis.connection.RedisMode;
 import io.phasetwo.keycloak.redis.userSession.expiration.SessionExpirationData;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import lombok.extern.jbosslog.JBossLog;
 import org.keycloak.common.util.Time;
 import org.keycloak.models.*;
@@ -80,40 +77,21 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
     log.tracef("[redis] SMEMBERS %s", indexKey);
     Set<String> strIds = jedis.smembers(indexKey);
     if (strIds != null && !strIds.isEmpty()) {
-      Stream<RedisAuthenticatedClientSessionAdapter> resolved;
-      if (clientSessionTrx.getRedisMode() == RedisMode.CLUSTER) {
-        // Cluster mode: eagerly resolve so dangling parent-index members — whose client-session
-        // hash has expired/vanished — are reconciled (SREM'd) out of the Set, making enumeration
-        // self-healing (issue #78). Best-effort/fail-open. Standalone/sentinel keep the lazy path.
-        List<RedisAuthenticatedClientSessionAdapter> live = Lists.newArrayList();
-        List<String> dead = Lists.newArrayList();
-        for (String strId : strIds) {
-          RedisAuthenticatedClientSessionAdapter cs =
-              clientSessionTrx.getIfPresent(AuthenticatedClientSessionKey.fromString(strId));
-          if (cs == null) {
-            dead.add(strId);
-          } else {
-            live.add(cs);
-          }
+      // Resolve members; a member whose client-session hash has expired/vanished is dangling and is
+      // registered for reap-at-commit so the parent-index self-heals without writing on the read
+      // path, in every mode (issue #78).
+      List<RedisAuthenticatedClientSessionAdapter> live = Lists.newArrayList();
+      for (String strId : strIds) {
+        RedisAuthenticatedClientSessionAdapter cs =
+            clientSessionTrx.getIfPresent(AuthenticatedClientSessionKey.fromString(strId));
+        if (cs == null) {
+          clientSessionTrx.reapIndexMemberOnCommit(indexKey, strId);
+        } else {
+          live.add(cs);
         }
-        if (!dead.isEmpty()) {
-          try {
-            log.tracef("[redis] SREM %s %s (stale index reconciliation)", indexKey, dead);
-            jedis.srem(indexKey, dead.toArray(new String[0]));
-          } catch (Exception e) {
-            log.warnf(e, "Failed to reconcile stale members from index %s", indexKey);
-          }
-        }
-        resolved = live.stream();
-      } else {
-        resolved =
-            strIds.stream()
-                .map(AuthenticatedClientSessionKey::fromString)
-                .map(clientSessionTrx::getIfPresent)
-                .filter(Objects::nonNull);
       }
       clientSessions =
-          resolved
+          live.stream()
               .filter(this::filterAndRemoveExpiredClientSessions)
               .filter(this::matchingOfflineFlag)
               .filter(this::filterAndRemoveClientSessionWithoutClient)

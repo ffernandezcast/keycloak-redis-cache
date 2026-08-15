@@ -30,7 +30,6 @@ import redis.clients.jedis.UnifiedJedis;
 public class RedisUserSessionProvider implements UserSessionProvider {
   private final KeycloakSession session;
   private final UnifiedJedis jedis;
-  private final RedisMode redisMode;
 
   private final RedisChangelogTransaction<UserSessionKey, RedisUserSessionAdapter> userSessionTrx;
   private final RedisChangelogTransaction<
@@ -48,7 +47,6 @@ public class RedisUserSessionProvider implements UserSessionProvider {
       KeycloakSession session, UnifiedJedis jedis, RedisMode redisMode) {
     this.session = session;
     this.jedis = jedis;
-    this.redisMode = redisMode;
 
     this.clientSessionTrx =
         new RedisChangelogTransaction<>(
@@ -263,79 +261,81 @@ public class RedisUserSessionProvider implements UserSessionProvider {
 
   private Stream<RedisUserSessionAdapter> getUserSessionsStreamByIndexKey(
       String[] indexKeys, RealmModel realm, boolean offline) {
-    log.tracef("[redis] SMEMBERS %s", indexKeys);
-    try (AbstractPipeline pipeline = jedis.pipelined()) {
-      List<Response<Set<String>>> responses = Lists.newArrayList();
-
-      for (String indexKey : indexKeys) {
-        responses.add(pipeline.smembers(indexKey));
-      }
-
-      pipeline.sync(); // This executes the batch
-
-      Set<String> strIds =
-          responses.stream()
-              .map(Response::get)
-              .filter(Objects::nonNull)
-              .flatMap(Set::stream)
-              .collect(Collectors.toSet());
-
-      if (!strIds.isEmpty()) {
-        if (redisMode == RedisMode.CLUSTER) {
-          // Cluster mode: eagerly resolve so stale (dangling) index members — whose session hash
-          // has TTL-expired/vanished — can be reconciled (SREM'd) out of the index Set, making
-          // by-index reads self-healing instead of letting the Sets grow unbounded (issue #78).
-          // Gated to cluster; standalone/sentinel keep the untouched lazy stream below.
-          List<RedisUserSessionAdapter> live = Lists.newArrayList();
-          List<String> dead = Lists.newArrayList();
-          for (String strId : strIds) {
-            RedisUserSessionAdapter entity =
-                userSessionTrx.getIfPresent(UserSessionKey.fromString(strId));
-            if (entity == null) {
-              dead.add(strId);
-            } else {
-              live.add(entity);
-            }
-          }
-          reconcileStaleIndexMembers(indexKeys, dead);
-          return live.stream()
-              .filter(s -> s.getRealmId().equals(realm.getId()))
-              .filter(s -> offline == s.isOffline());
+    log.tracef("[redis] SMEMBERS %s", Arrays.toString(indexKeys));
+    try {
+      // Read the index Sets in one pipelined batch, then close that pipeline (return its pooled
+      // connection) BEFORE resolving members via getAll — which opens its own pipeline. Holding
+      // both
+      // open at once would pin two pooled connections per call on this hot read path and can
+      // exhaust
+      // the connection pool under concurrency (the very failure getAll's try-with-resources
+      // guards).
+      List<Set<String>> membersPerIndex = Lists.newArrayList();
+      Set<String> allStrIds = Sets.newLinkedHashSet();
+      try (AbstractPipeline pipeline = jedis.pipelined()) {
+        List<Response<Set<String>>> responses = Lists.newArrayList();
+        for (String indexKey : indexKeys) {
+          responses.add(pipeline.smembers(indexKey));
         }
-        return strIds.stream()
-            .map(UserSessionKey::fromString)
-            .map(userSessionTrx::getIfPresent)
-            .filter(Objects::nonNull)
-            .filter(s -> s.getRealmId().equals(realm.getId()))
-            .filter(s -> offline == s.isOffline());
+        pipeline.sync(); // This executes the batch
+        for (Response<Set<String>> response : responses) {
+          Set<String> members = response.get();
+          members = members == null ? Set.of() : members;
+          membersPerIndex.add(members);
+          allStrIds.addAll(members);
+        }
       }
+      if (allStrIds.isEmpty()) {
+        return Stream.empty();
+      }
+
+      // Resolve all members in one pipelined batch (getAll), then reconcile. A member whose session
+      // hash has expired/vanished does not resolve and is dangling: it is registered for reap-at-
+      // commit so the by-index Sets self-heal without any write on the read path, in every mode
+      // (issue #78). Dead members are attributed per index (rather than over the union) so each is
+      // only removed from the Set it actually came from. Live members are de-duplicated across
+      // indexes by getAll's result map.
+      Map<UserSessionKey, RedisUserSessionAdapter> resolved =
+          userSessionTrx.getAll(
+              allStrIds.stream().map(UserSessionKey::fromString).collect(Collectors.toList()));
+      Map<String, RedisUserSessionAdapter> liveByKey =
+          resolved.entrySet().stream()
+              .collect(Collectors.toMap(e -> e.getKey().key(), Map.Entry::getValue));
+
+      // Per index: register any dangling member for reap-at-commit, and push the Set's TTL up to
+      // cover the longest-lived live member it holds (issue #78, review finding A). The write-path
+      // backstop stamps the Set from whichever session last wrote it, so a longer-lived member that
+      // is never re-written could be stranded under a shorter co-tenant's TTL and silently dropped
+      // from the index; reads grow the TTL back (GT), or PERSIST the Set when a live member never
+      // expires (null expiration). Both are deferred to commit — never written on the read path.
+      for (int i = 0; i < indexKeys.length; i++) {
+        boolean neverExpires = false;
+        Long maxExpiration = null;
+        for (String strId : membersPerIndex.get(i)) {
+          RedisUserSessionAdapter live = liveByKey.get(strId);
+          if (live == null) {
+            userSessionTrx.reapIndexMemberOnCommit(indexKeys[i], strId);
+          } else if (live.getExpiration() == null) {
+            neverExpires = true;
+          } else if (maxExpiration == null || live.getExpiration() > maxExpiration) {
+            maxExpiration = live.getExpiration();
+          }
+        }
+        if (neverExpires) {
+          userSessionTrx.extendIndexTtlOnCommit(indexKeys[i], null);
+        } else if (maxExpiration != null) {
+          userSessionTrx.extendIndexTtlOnCommit(indexKeys[i], maxExpiration);
+        }
+      }
+
+      return resolved.values().stream()
+          .filter(s -> s.getRealmId().equals(realm.getId()))
+          .filter(s -> offline == s.isOffline());
     } catch (Exception e) {
       log.error("Pipeline failed", e);
     }
 
     return Stream.empty();
-  }
-
-  /**
-   * Cluster-mode only: remove index members that resolved to no entity (their session hash has
-   * expired/vanished) from each index Set they were read from, so the by-index Sets self-heal on
-   * read instead of growing unbounded. No-op in standalone/sentinel, where the delete path keeps
-   * indexes consistent via a MULTI/EXEC transaction. Best-effort (fail-open): a reconciliation
-   * failure never breaks the read. See issue #78.
-   */
-  private void reconcileStaleIndexMembers(String[] indexKeys, List<String> deadMembers) {
-    if (redisMode != RedisMode.CLUSTER || deadMembers.isEmpty()) {
-      return;
-    }
-    String[] members = deadMembers.toArray(new String[0]);
-    for (String indexKey : indexKeys) {
-      try {
-        log.tracef("[redis] SREM %s %s (stale index reconciliation)", indexKey, deadMembers);
-        jedis.srem(indexKey, members);
-      } catch (Exception e) {
-        log.warnf(e, "Failed to reconcile stale members from index %s", indexKey);
-      }
-    }
   }
 
   // xx
@@ -360,11 +360,10 @@ public class RedisUserSessionProvider implements UserSessionProvider {
 
   /**
    * Reads the authenticated-client:client-index Set for a client and resolves its members to live
-   * client-session adapters (matching realm and client). In cluster mode this eagerly resolves so
-   * that dangling members — whose client-session hash has expired/vanished — are reconciled
-   * ({@code SREM}'d) out of the Set, making the by-client reads self-healing (issue #78). In
-   * standalone/sentinel the original lazy resolution is kept unchanged. Members are read in a stable
-   * (sorted) order in both modes, preserving pagination consistency for callers.
+   * client-session adapters (matching realm and client). In every mode this eagerly resolves so
+   * that dangling members — whose client-session hash has expired/vanished — are reconciled ({@code
+   * SREM}'d at commit) out of the Set, making the by-client reads self-healing (issue #78). Members
+   * are read in a stable (sorted) order, preserving pagination consistency for callers.
    */
   private Stream<RedisAuthenticatedClientSessionAdapter> getClientSessionsByClientIndex(
       RealmModel realm, ClientModel client) {
@@ -374,27 +373,41 @@ public class RedisUserSessionProvider implements UserSessionProvider {
     if (strIds.isEmpty()) {
       return Stream.empty();
     }
-    if (redisMode == RedisMode.CLUSTER) {
-      List<RedisAuthenticatedClientSessionAdapter> live = Lists.newArrayList();
-      List<String> dead = Lists.newArrayList();
-      for (String strId : strIds) {
-        RedisAuthenticatedClientSessionAdapter entity =
-            clientSessionTrx.getIfPresent(AuthenticatedClientSessionKey.fromString(strId));
-        if (entity == null) {
-          dead.add(strId);
-        } else {
-          live.add(entity);
-        }
+    // Resolve all members in one pipelined batch (getAll). A member whose client-session hash has
+    // expired/vanished does not resolve and is dangling: it is registered for reap-at-commit so the
+    // client-index self-heals without writing on the read path, in every mode (issue #78).
+    Map<AuthenticatedClientSessionKey, RedisAuthenticatedClientSessionAdapter> resolved =
+        clientSessionTrx.getAll(
+            strIds.stream()
+                .map(AuthenticatedClientSessionKey::fromString)
+                .collect(Collectors.toList()));
+    Map<String, RedisAuthenticatedClientSessionAdapter> liveByKey =
+        resolved.entrySet().stream()
+            .collect(Collectors.toMap(e -> e.getKey().key(), Map.Entry::getValue));
+    // Reap dangling members and grow the client-index TTL to cover its longest-lived live member
+    // (issue #78, review finding A); see getUserSessionsStreamByIndexKey for the rationale.
+    boolean neverExpires = false;
+    Long maxExpiration = null;
+    for (String strId : strIds) {
+      RedisAuthenticatedClientSessionAdapter live = liveByKey.get(strId);
+      if (live == null) {
+        clientSessionTrx.reapIndexMemberOnCommit(indexKey, strId);
+      } else if (live.getExpiration() == null) {
+        neverExpires = true;
+      } else if (maxExpiration == null || live.getExpiration() > maxExpiration) {
+        maxExpiration = live.getExpiration();
       }
-      reconcileStaleIndexMembers(new String[] {indexKey}, dead);
-      return live.stream()
-          .filter(c -> c.getRealmId().equals(realm.getId()))
-          .filter(c -> c.getClientUuid().equals(client.getId()));
     }
-    return strIds.stream()
-        .map(AuthenticatedClientSessionKey::fromString)
-        .map(clientSessionTrx::getIfPresent)
-        .filter(Objects::nonNull)
+    if (neverExpires) {
+      clientSessionTrx.extendIndexTtlOnCommit(indexKey, null);
+    } else if (maxExpiration != null) {
+      clientSessionTrx.extendIndexTtlOnCommit(indexKey, maxExpiration);
+    }
+    return resolved.values().stream()
+        // getAll's result map orders cached entries before uncached ones, so it is not globally
+        // sorted; re-impose the stable member-key order the callers' skip/limit pagination relies
+        // on.
+        .sorted(Comparator.comparing(c -> c.getKey().key()))
         .filter(c -> c.getRealmId().equals(realm.getId()))
         .filter(c -> c.getClientUuid().equals(client.getId()));
   }
@@ -617,10 +630,11 @@ public class RedisUserSessionProvider implements UserSessionProvider {
     return getOfflineUserSessionEntityStream(realm, userSessionId)
         .filter(Objects::nonNull)
         .findFirst()
-        .orElse(
-            getUserSessionsStreamByIndexKey(correspondingSessionIndex, realm, true)
-                .findFirst()
-                .orElse(null));
+        .orElseGet(
+            () ->
+                getUserSessionsStreamByIndexKey(correspondingSessionIndex, realm, true)
+                    .findFirst()
+                    .orElse(null));
   }
 
   // xx
@@ -725,6 +739,7 @@ public class RedisUserSessionProvider implements UserSessionProvider {
 
     return getClientSessionsByClientIndex(realm, client)
         .map(RedisAuthenticatedClientSessionAdapter::getUserSession)
+        .filter(Objects::nonNull)
         .filter(UserSessionModel::isOffline)
         .count();
   }
