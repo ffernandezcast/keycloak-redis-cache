@@ -18,15 +18,19 @@ package io.phasetwo.keycloak.redis.testsuite.session;
 
 import static io.phasetwo.keycloak.redis.testsuite.session.SessionTestUtils.createClients;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 
 import io.phasetwo.keycloak.redis.RedisHashCas;
 import io.phasetwo.keycloak.redis.authSession.RedisAuthenticationSessionProvider;
 import io.phasetwo.keycloak.redis.connection.RedisMode;
 import io.phasetwo.keycloak.redis.testsuite.KeycloakModelTest;
+import java.util.Set;
+import java.util.UUID;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.keycloak.common.util.Time;
 import org.keycloak.models.ClientModel;
 import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
@@ -135,5 +139,227 @@ public class AuthSessionTtlBackstopTest extends KeycloakModelTest {
             + pttl,
         pttl > 0L,
         is(true));
+  }
+
+  /**
+   * Since #78 gave each child auth-session hash its own native TTL, {@code
+   * removeAuthenticationSessionByTabId} must re-stamp the <em>surviving</em> children when it bumps
+   * the root's horizon. Otherwise a still-active child keeps its original (now shorter) TTL and can
+   * expire before its refreshed root — silently dropping a live login mid-flow. Two tabs share a
+   * root; after time passes and one tab is removed, the survivor's PTTL must track the root's new
+   * horizon, not its original one.
+   */
+  @Test
+  public void removeByTabIdReStampsSurvivingChildTtl() {
+    String[] ctx = new String[3]; // rootId, survivingClientUuid, survivingTabId
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          ClientModel client = realm.getClientByClientId("test-app");
+          RedisAuthenticationSessionProvider provider =
+              new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+          RootAuthenticationSessionModel root = provider.createRootAuthenticationSession(realm);
+          root.createAuthenticationSession(client); // the tab we will remove
+          AuthenticationSessionModel survivor = root.createAuthenticationSession(client);
+          ctx[0] = root.getId();
+          ctx[1] = client.getId();
+          ctx[2] = survivor.getTabId();
+          return null;
+        });
+
+    String survivorKey = String.format("auth-session:%s:%s", ctx[1], ctx[2]);
+    long lifespanMs = 1800L * 1000; // realm accessCodeLifespanLogin
+    // Sanity: survivor starts near the original horizon.
+    assertThat(jedis.pttl(survivorKey) <= lifespanMs, is(true));
+
+    try {
+      // Advance well past creation but comfortably inside the lifespan.
+      Time.setOffset(600); // +10 min
+
+      withRealm(
+          realmId,
+          (s, realm) -> {
+            RedisAuthenticationSessionProvider provider =
+                new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+            RootAuthenticationSessionModel root =
+                provider.getRootAuthenticationSession(realm, ctx[0]);
+            // Remove the OTHER tab, leaving the survivor; this bumps the root's horizon.
+            String removeTabId =
+                root.getAuthenticationSessions().keySet().stream()
+                    .filter(t -> !t.equals(ctx[2]))
+                    .findFirst()
+                    .orElseThrow();
+            root.removeAuthenticationSessionByTabId(removeTabId);
+            return null;
+          });
+
+      // With the fix the survivor's TTL is re-stamped to the bumped horizon (~600s + 1800s from
+      // creation ≈ 2400s remaining); without it, it keeps the original ~1800s.
+      long after = jedis.pttl(survivorKey);
+      long twoThousandSecondsMs = 2000L * 1000;
+      assertThat(
+          "surviving child TTL must be re-stamped to the root's bumped horizon; pttl was " + after,
+          after > twoThousandSecondsMs,
+          is(true));
+    } finally {
+      Time.setOffset(0);
+    }
+  }
+
+  /**
+   * {@code restartSession} clears the root's children and starts it fresh, so it must also re-stamp
+   * the root's own TTL horizon (#78 gave the root a native expiration). Resetting only the
+   * timestamp would leave a root restarted late in its lifespan under its old, possibly imminent,
+   * expiration — so it could vanish mid-flow before the next {@code createAuthenticationSession}
+   * re-stamps it. After time passes and the root is restarted, its PTTL must track the fresh
+   * horizon, not the original one.
+   */
+  @Test
+  public void restartReStampsRootTtl() {
+    String rootId =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              ClientModel client = realm.getClientByClientId("test-app");
+              RedisAuthenticationSessionProvider provider =
+                  new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+              RootAuthenticationSessionModel root = provider.createRootAuthenticationSession(realm);
+              root.createAuthenticationSession(client);
+              return root.getId();
+            });
+
+    String rootKey = String.format("root-auth-session:%s:%s", realmId, rootId);
+    long lifespanMs = 1800L * 1000; // realm accessCodeLifespanLogin
+    // Sanity: root starts near the original horizon.
+    assertThat(jedis.pttl(rootKey) <= lifespanMs, is(true));
+
+    try {
+      // Advance well past creation but comfortably inside the lifespan.
+      Time.setOffset(600); // +10 min
+
+      withRealm(
+          realmId,
+          (s, realm) -> {
+            RedisAuthenticationSessionProvider provider =
+                new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+            RootAuthenticationSessionModel root =
+                provider.getRootAuthenticationSession(realm, rootId);
+            root.restartSession(realm);
+            return null;
+          });
+
+      // With the fix the root's TTL is re-stamped to the bumped horizon (~600s + 1800s from
+      // creation
+      // ≈ 2400s remaining); without it, it keeps the original ~1800s (elapsed to ~1200s remaining).
+      long after = jedis.pttl(rootKey);
+      long twoThousandSecondsMs = 2000L * 1000;
+      assertThat(
+          "restart must re-stamp the root's TTL to a fresh horizon; pttl was " + after,
+          after > twoThousandSecondsMs,
+          is(true));
+    } finally {
+      Time.setOffset(0);
+    }
+  }
+
+  /**
+   * Opening a new tab ({@code createAuthenticationSession}) bumps the root's horizon and stamps the
+   * new child's TTL — but it must also re-stamp the <em>already-open</em> sibling tabs. Since #78
+   * gave each child its own native hash TTL, leaving an earlier sibling on its original horizon
+   * lets it TTL-expire before the refreshed root and vanish mid-login while the root is still
+   * alive. Tab A is created, time passes, tab B is opened; tab A's PTTL must track the bumped
+   * horizon (issue #78 review).
+   */
+  @Test
+  public void createAuthenticationSessionReStampsExistingSiblingTtl() {
+    String[] ctx = new String[3]; // rootId, clientUuid, tabAId
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          ClientModel client = realm.getClientByClientId("test-app");
+          RedisAuthenticationSessionProvider provider =
+              new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+          RootAuthenticationSessionModel root = provider.createRootAuthenticationSession(realm);
+          AuthenticationSessionModel tabA = root.createAuthenticationSession(client);
+          ctx[0] = root.getId();
+          ctx[1] = client.getId();
+          ctx[2] = tabA.getTabId();
+          return null;
+        });
+
+    String tabAKey = String.format("auth-session:%s:%s", ctx[1], ctx[2]);
+    long lifespanMs = 1800L * 1000; // realm accessCodeLifespanLogin
+    assertThat(
+        "tab A starts near the original horizon", jedis.pttl(tabAKey) <= lifespanMs, is(true));
+
+    try {
+      // Time passes, then a second tab is opened under the same root.
+      Time.setOffset(600); // +10 min
+
+      withRealm(
+          realmId,
+          (s, realm) -> {
+            ClientModel client = realm.getClientByClientId("test-app");
+            RedisAuthenticationSessionProvider provider =
+                new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+            RootAuthenticationSessionModel root =
+                provider.getRootAuthenticationSession(realm, ctx[0]);
+            root.createAuthenticationSession(client); // tab B — must re-stamp tab A too
+            return null;
+          });
+
+      long after = jedis.pttl(tabAKey);
+      long twoThousandSecondsMs = 2000L * 1000;
+      assertThat(
+          "opening a new tab must re-stamp the existing sibling tab's TTL; pttl was " + after,
+          after > twoThousandSecondsMs,
+          is(true));
+    } finally {
+      Time.setOffset(0);
+    }
+  }
+
+  /**
+   * The auth-session parent-index read ({@code getAuthenticationSessions}) must self-heal like the
+   * other by-index reads: a dangling member (its child hash TTL-expired/vanished) is registered for
+   * reap-at-commit, so an actively-used root's parent-index Set does not accumulate stale members
+   * (issue #78 review).
+   */
+  @Test
+  public void getAuthenticationSessionsReapsDanglingChildAtCommit() {
+    String rootId =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              ClientModel client = realm.getClientByClientId("test-app");
+              RedisAuthenticationSessionProvider provider =
+                  new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+              RootAuthenticationSessionModel root = provider.createRootAuthenticationSession(realm);
+              root.createAuthenticationSession(client);
+              return root.getId();
+            });
+    String indexKey = "auth-session:parent:" + rootId;
+
+    // Plant a dangling parent-index member (no backing hash), alongside the real live child.
+    String dangling = "auth-session:" + UUID.randomUUID() + ":" + UUID.randomUUID();
+    jedis.sadd(indexKey, dangling);
+    assertThat(ClusterTestSupport.members(jedis, indexKey), hasSize(2));
+
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          RedisAuthenticationSessionProvider provider =
+              new RedisAuthenticationSessionProvider(s, jedis, RedisMode.STANDALONE, 300);
+          RootAuthenticationSessionModel root =
+              provider.getRootAuthenticationSession(realm, rootId);
+          root.getAuthenticationSessions(); // drives the parent-index read → schedules the reap
+          return null;
+        });
+
+    // After commit the dangling member is reaped; the real live child remains.
+    Set<String> after = ClusterTestSupport.members(jedis, indexKey);
+    assertThat(
+        "dangling auth-session parent-index member must be reaped at commit", after, hasSize(1));
+    assertThat(after.contains(dangling), is(false));
   }
 }

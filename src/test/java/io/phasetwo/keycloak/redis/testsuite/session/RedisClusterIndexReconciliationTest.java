@@ -100,6 +100,11 @@ public class RedisClusterIndexReconciliationTest extends KeycloakModelTest {
     RealmModel realm = s.realms().getRealm(realmId);
     s.getContext().setRealm(realm);
     s.realms().removeRealm(realmId);
+    // Flush the shared single-node cluster between methods so index Sets and session hashes don't
+    // accumulate across tests: removeRealm drives the factory provider's own Valkey, not this
+    // clusterJedis, so without this the container's state bleeds across methods and only freshly
+    // generated ids keep the tests order-independent. Mirrors the standalone suites.
+    clusterJedis.flushAll();
   }
 
   /**

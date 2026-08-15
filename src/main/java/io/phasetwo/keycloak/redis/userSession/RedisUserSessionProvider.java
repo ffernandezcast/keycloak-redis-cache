@@ -298,9 +298,6 @@ public class RedisUserSessionProvider implements UserSessionProvider {
       Map<UserSessionKey, RedisUserSessionAdapter> resolved =
           userSessionTrx.getAll(
               allStrIds.stream().map(UserSessionKey::fromString).collect(Collectors.toList()));
-      Map<String, RedisUserSessionAdapter> liveByKey =
-          resolved.entrySet().stream()
-              .collect(Collectors.toMap(e -> e.getKey().key(), Map.Entry::getValue));
 
       // Per index: register any dangling member for reap-at-commit, and push the Set's TTL up to
       // cover the longest-lived live member it holds (issue #78, review finding A). The write-path
@@ -309,23 +306,16 @@ public class RedisUserSessionProvider implements UserSessionProvider {
       // from the index; reads grow the TTL back (GT), or PERSIST the Set when a live member never
       // expires (null expiration). Both are deferred to commit — never written on the read path.
       for (int i = 0; i < indexKeys.length; i++) {
-        boolean neverExpires = false;
-        Long maxExpiration = null;
+        List<Long> liveExpirations = Lists.newArrayList();
         for (String strId : membersPerIndex.get(i)) {
-          RedisUserSessionAdapter live = liveByKey.get(strId);
+          RedisUserSessionAdapter live = resolved.get(UserSessionKey.fromString(strId));
           if (live == null) {
             userSessionTrx.reapIndexMemberOnCommit(indexKeys[i], strId);
-          } else if (live.getExpiration() == null) {
-            neverExpires = true;
-          } else if (maxExpiration == null || live.getExpiration() > maxExpiration) {
-            maxExpiration = live.getExpiration();
+          } else {
+            liveExpirations.add(live.getExpiration());
           }
         }
-        if (neverExpires) {
-          userSessionTrx.extendIndexTtlOnCommit(indexKeys[i], null);
-        } else if (maxExpiration != null) {
-          userSessionTrx.extendIndexTtlOnCommit(indexKeys[i], maxExpiration);
-        }
+        userSessionTrx.extendIndexTtlToCoverLiveMembers(indexKeys[i], liveExpirations);
       }
 
       return resolved.values().stream()
@@ -369,47 +359,46 @@ public class RedisUserSessionProvider implements UserSessionProvider {
       RealmModel realm, ClientModel client) {
     String indexKey = String.format("authenticated-client:client-index:%s", client.getId());
     log.tracef("[redis] SMEMBERS %s", indexKey);
-    Set<String> strIds = Sets.newTreeSet(jedis.smembers(indexKey)); // for consistent sorting
-    if (strIds.isEmpty()) {
+    try {
+      // Guard a null reply and swallow transient Redis failures exactly as
+      // getUserSessionsStreamByIndexKey does, so one malformed member or a connection blip returns
+      // an empty stream instead of throwing uncaught out of getUserSessionsStream(realm, client),
+      // getOfflineSessionsCount and getOfflineUserSessionsStream (issue #78 review).
+      Set<String> strIds = jedis.smembers(indexKey);
+      if (strIds == null || strIds.isEmpty()) {
+        return Stream.empty();
+      }
+      // Resolve all members in one pipelined batch (getAll). A member whose client-session hash has
+      // expired/vanished does not resolve and is dangling: it is registered for reap-at-commit so
+      // the client-index self-heals without writing on the read path, in every mode (issue #78).
+      Map<AuthenticatedClientSessionKey, RedisAuthenticatedClientSessionAdapter> resolved =
+          clientSessionTrx.getAll(
+              strIds.stream()
+                  .map(AuthenticatedClientSessionKey::fromString)
+                  .collect(Collectors.toList()));
+      // Reap dangling members and grow the client-index TTL to cover its longest-lived live member
+      // (issue #78, review finding A); see getUserSessionsStreamByIndexKey for the rationale.
+      List<Long> liveExpirations = Lists.newArrayList();
+      for (String strId : strIds) {
+        RedisAuthenticatedClientSessionAdapter live =
+            resolved.get(AuthenticatedClientSessionKey.fromString(strId));
+        if (live == null) {
+          clientSessionTrx.reapIndexMemberOnCommit(indexKey, strId);
+        } else {
+          liveExpirations.add(live.getExpiration());
+        }
+      }
+      clientSessionTrx.extendIndexTtlToCoverLiveMembers(indexKey, liveExpirations);
+      // getAll's result map orders cached entries before uncached ones, so it is not globally
+      // sorted; re-impose the stable member-key order the callers' skip/limit pagination relies on.
+      return resolved.values().stream()
+          .sorted(Comparator.comparing(c -> c.getKey().key()))
+          .filter(c -> c.getRealmId().equals(realm.getId()))
+          .filter(c -> c.getClientUuid().equals(client.getId()));
+    } catch (Exception e) {
+      log.error("Pipeline failed", e);
       return Stream.empty();
     }
-    // Resolve all members in one pipelined batch (getAll). A member whose client-session hash has
-    // expired/vanished does not resolve and is dangling: it is registered for reap-at-commit so the
-    // client-index self-heals without writing on the read path, in every mode (issue #78).
-    Map<AuthenticatedClientSessionKey, RedisAuthenticatedClientSessionAdapter> resolved =
-        clientSessionTrx.getAll(
-            strIds.stream()
-                .map(AuthenticatedClientSessionKey::fromString)
-                .collect(Collectors.toList()));
-    Map<String, RedisAuthenticatedClientSessionAdapter> liveByKey =
-        resolved.entrySet().stream()
-            .collect(Collectors.toMap(e -> e.getKey().key(), Map.Entry::getValue));
-    // Reap dangling members and grow the client-index TTL to cover its longest-lived live member
-    // (issue #78, review finding A); see getUserSessionsStreamByIndexKey for the rationale.
-    boolean neverExpires = false;
-    Long maxExpiration = null;
-    for (String strId : strIds) {
-      RedisAuthenticatedClientSessionAdapter live = liveByKey.get(strId);
-      if (live == null) {
-        clientSessionTrx.reapIndexMemberOnCommit(indexKey, strId);
-      } else if (live.getExpiration() == null) {
-        neverExpires = true;
-      } else if (maxExpiration == null || live.getExpiration() > maxExpiration) {
-        maxExpiration = live.getExpiration();
-      }
-    }
-    if (neverExpires) {
-      clientSessionTrx.extendIndexTtlOnCommit(indexKey, null);
-    } else if (maxExpiration != null) {
-      clientSessionTrx.extendIndexTtlOnCommit(indexKey, maxExpiration);
-    }
-    return resolved.values().stream()
-        // getAll's result map orders cached entries before uncached ones, so it is not globally
-        // sorted; re-impose the stable member-key order the callers' skip/limit pagination relies
-        // on.
-        .sorted(Comparator.comparing(c -> c.getKey().key()))
-        .filter(c -> c.getRealmId().equals(realm.getId()))
-        .filter(c -> c.getClientUuid().equals(client.getId()));
   }
 
   // xx

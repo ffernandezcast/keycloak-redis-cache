@@ -34,6 +34,7 @@ import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.keycloak.common.util.Time;
 import org.keycloak.models.ClientModel;
 import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
@@ -727,5 +728,316 @@ public class RedisIndexBackstopAllModesTest extends KeycloakModelTest {
         "read must grow the client-index TTL to cover the live member; was " + after,
         after > thirtyMinutesMs,
         is(true));
+  }
+
+  /**
+   * The parent-index read path ({@code RedisUserSessionAdapter.getAuthenticatedClientSessions})
+   * self-heals the TTL exactly like the provider's user-index/client-index reads: a live
+   * authenticated-client member found in the {@code authenticated-client:parent-index} Set must
+   * grow that Set's TTL ({@code GT}) to cover the member's expiration, so a longer-lived client
+   * session that is never re-written cannot be stranded under a shorter co-tenant's TTL and dropped
+   * from the parent-index (issue&nbsp;#78, review finding&nbsp;A).
+   *
+   * <p>The adapter resolves each child's parent via {@code session.sessions()} — the
+   * factory-registered provider on its <em>own</em> Valkey (see {@code RedisParameters}), not this
+   * test's {@code jedis} — inside {@code matchingOfflineFlag}. A member whose parent cannot resolve
+   * there NPEs before the filters, so the planted member's {@code parentId} points at a real user
+   * session created through {@code session.sessions()}; the member hash itself lives in this test's
+   * {@code jedis} so {@code getIfPresent} resolves it as a live member.
+   */
+  @Test
+  public void readGrowsParentIndexTtlToCoverLiveMember() {
+    String clientUuid =
+        withRealm(realmId, (s, realm) -> realm.getClientByClientId("test-app").getId());
+
+    // A parent user session the child's getUserSession() can resolve. It must live in the
+    // factory-registered provider's Redis, so create it through session.sessions() (online, so
+    // matchingOfflineFlag matches the online enclosing session).
+    String resolvableParentId =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              UserModel user = s.users().getUserByUsername(realm, "user1");
+              return s.sessions()
+                  .createUserSession(realm, user, "user1", "127.0.0.1", "form", true, null, null)
+                  .getId();
+            });
+
+    // The user session whose parent-index we exercise, written to THIS test's jedis via the manual
+    // provider so we can inspect and manipulate the Set directly.
+    String userSessionId =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              UserModel user = s.users().getUserByUsername(realm, "user1");
+              RedisUserSessionProvider provider =
+                  new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+              return provider
+                  .createUserSession(realm, user, "user1", "127.0.0.1", "form", true, null, null)
+                  .getId();
+            });
+    String indexKey = ClusterTestSupport.parentIndexKey(userSessionId);
+
+    // Plant a LIVE authenticated-client member (~1h horizon) whose parent and client both resolve,
+    // so it survives resolution and the filters instead of being reaped.
+    long memberExpMs = System.currentTimeMillis() + 60L * 60 * 1000;
+    String csId = resolvableParentId + "::" + clientUuid;
+    String csKey = "authenticated-client:" + csId;
+    Map<String, String> data = new HashMap<>();
+    data.put("id", csId);
+    data.put("parentId", resolvableParentId);
+    data.put("realmId", realmId);
+    data.put("clientUuid", clientUuid);
+    data.put("timestamp", String.valueOf(System.currentTimeMillis() / 1000));
+    data.put("expiration", String.valueOf(memberExpMs));
+    data.put("version", "0");
+    data.put("offline", "false");
+    jedis.hset(csKey, data);
+    jedis.sadd(indexKey, csKey);
+
+    // Under-cover the Set with a short (5 min) TTL, as a shorter-lived co-tenant would have
+    // stamped.
+    jedis.pexpireAt(indexKey, System.currentTimeMillis() + 5L * 60 * 1000);
+
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+          UserSessionModel userSession = provider.getUserSession(realm, userSessionId);
+          userSession.getAuthenticatedClientSessions(); // drives the parent-index read
+          return null;
+        });
+
+    long after = ClusterTestSupport.pttl(jedis, indexKey);
+    long thirtyMinutesMs = 30L * 60 * 1000;
+    assertThat(
+        "read must grow the parent-index TTL to cover the live member; was " + after,
+        after > thirtyMinutesMs,
+        is(true));
+  }
+
+  /**
+   * A by-index read resolves its members through {@code RedisChangelogTransaction.getAll}. When a
+   * session was cached earlier in the same transaction while valid and has since crossed its
+   * expiration, {@code getAll} must not hand it back as live — it has to apply the same {@code
+   * expired()} re-check {@code getIfPresent} does, otherwise the read counts an expired session as
+   * active, never reaps it, and even extends the index Set's TTL to cover it (issue&nbsp;#78
+   * review).
+   */
+  @Test
+  public void getAllDoesNotReturnCachedEntryThatHasSinceExpired() {
+    String userId =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              UserModel user = s.users().getUserByUsername(realm, "user1");
+              RedisUserSessionProvider provider =
+                  new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+              provider.createUserSession(
+                  realm, user, "user1", "127.0.0.1", "form", true, null, null);
+              return user.getId();
+            });
+
+    try {
+      long count =
+          withRealm(
+              realmId,
+              (s, realm) -> {
+                UserModel user = s.users().getUserByUsername(realm, "user1");
+                // One provider instance => one shared transaction cache across both reads.
+                RedisUserSessionProvider provider =
+                    new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+
+                // First read caches the (still-valid) session in the transaction.
+                assertThat(provider.getUserSessionsStream(realm, user).count(), is(1L));
+
+                // Fast-forward past every online horizon (idle 1800s, max lifespan 36000s) so the
+                // cached model is now expired.
+                Time.setOffset(40_000);
+
+                // Second read resolves via getAll's cache-hit branch: the expired-but-cached
+                // session
+                // must not be returned as live.
+                return provider.getUserSessionsStream(realm, user).count();
+              });
+
+      assertThat("getAll must not return a cached session that has since expired", count, is(0L));
+    } finally {
+      Time.setOffset(0);
+    }
+  }
+
+  /**
+   * A read schedules the index-TTL extension to commit ({@code extendIndexTtlOnCommit}) using the
+   * horizon of a member that was live <em>at read time</em>. If real time crosses that horizon
+   * before the transaction commits (a long request, a short client-session lifespan, or clock
+   * skew), a naive {@code PEXPIREAT <pastEpoch> NX} on a Set that currently has <em>no</em> TTL
+   * would set an already-expired TTL and make Redis delete the whole Set — evicting every live
+   * co-member, including ones a read could never restore. The commit-time guard must skip a horizon
+   * that has already elapsed and leave the Set intact (issue&nbsp;#78 review finding&nbsp;1).
+   *
+   * <p>The horizon is a real epoch that Redis evaluates against its own clock, so the test uses a
+   * short real horizon and sleeps past it between the read and the commit — {@code Time.setOffset}
+   * would move only Keycloak's clock, not Redis's, and never trigger the wipe.
+   */
+  @Test
+  public void readSchedulingAnElapsedHorizonDoesNotWipeTheIndexSet() {
+    String userId =
+        withRealm(realmId, (s, realm) -> s.users().getUserByUsername(realm, "user1").getId());
+    String indexKey = ClusterTestSupport.userIndexKey(userId);
+
+    // A LIVE member whose horizon is only ~3s out: live when the read resolves it, but elapsed by
+    // the time the transaction commits (below). The Set carries NO TTL yet — the vulnerable state
+    // where a past-epoch NX would fire and delete it.
+    long memberExpMs = System.currentTimeMillis() + 3_000L;
+    String member = "user-session:" + UUID.randomUUID();
+    Map<String, String> data = new HashMap<>();
+    data.put("id", member.substring("user-session:".length()));
+    data.put("realmId", realmId);
+    data.put("userId", userId);
+    data.put("offline", "false");
+    data.put("version", "0");
+    data.put("timestamp", String.valueOf(System.currentTimeMillis() / 1000));
+    data.put("expiration", String.valueOf(memberExpMs));
+    jedis.hset(member, data);
+    jedis.sadd(indexKey, member);
+    assertThat(
+        "Set must start with no TTL so NX would fire",
+        ClusterTestSupport.pttl(jedis, indexKey),
+        is(-1L));
+
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          UserModel user = s.users().getUserByUsername(realm, "user1");
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+          // Read resolves the live member and schedules extendIndexTtlOnCommit(indexKey,
+          // memberExpMs).
+          assertThat(provider.getUserSessionsStream(realm, user).count(), is(1L));
+          // Real time crosses the scheduled horizon before this transaction commits.
+          try {
+            Thread.sleep(3_500L);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+          }
+          return null;
+        });
+
+    // The Set (and its live member) must survive: a past-epoch PEXPIREAT NX would have deleted it.
+    assertThat(
+        "an elapsed TTL horizon must never wipe the index Set (issue #78 review finding 1)",
+        ClusterTestSupport.members(jedis, indexKey),
+        hasSize(1));
+  }
+
+  /**
+   * {@code getAuthenticatedClientSessions} resolves a live client-session member and then filters
+   * by offline flag via {@code cs.getUserSession().isOffline()}. If that member's parent user
+   * session has expired/vanished (getUserSession() returns null), the unguarded dereference NPEs
+   * and aborts the whole read (and getActiveClientSessionStats). The orphan must be filtered out
+   * instead (issue #78 review). The child resolves its parent via {@code session.sessions()} (the
+   * factory-registered provider's Redis), so a parentId that resolves nowhere yields a null parent.
+   */
+  @Test
+  public void getAuthenticatedClientSessionsSkipsOrphanedClientSessionWithNullParent() {
+    String clientUuid =
+        withRealm(realmId, (s, realm) -> realm.getClientByClientId("test-app").getId());
+    String userSessionId =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              UserModel user = s.users().getUserByUsername(realm, "user1");
+              RedisUserSessionProvider provider =
+                  new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+              return provider
+                  .createUserSession(realm, user, "user1", "127.0.0.1", "form", true, null, null)
+                  .getId();
+            });
+    String indexKey = ClusterTestSupport.parentIndexKey(userSessionId);
+
+    // A LIVE client-session member whose parent user session does not exist anywhere -> its
+    // getUserSession() resolves to null.
+    String danglingParentId = UUID.randomUUID().toString();
+    long memberExpMs = System.currentTimeMillis() + 60L * 60 * 1000;
+    String csId = danglingParentId + "::" + clientUuid;
+    String csKey = "authenticated-client:" + csId;
+    Map<String, String> data = new HashMap<>();
+    data.put("id", csId);
+    data.put("parentId", danglingParentId);
+    data.put("realmId", realmId);
+    data.put("clientUuid", clientUuid);
+    data.put("timestamp", String.valueOf(System.currentTimeMillis() / 1000));
+    data.put("expiration", String.valueOf(memberExpMs));
+    data.put("version", "0");
+    data.put("offline", "false");
+    jedis.hset(csKey, data);
+    jedis.sadd(indexKey, csKey);
+
+    int size =
+        withRealm(
+            realmId,
+            (s, realm) -> {
+              RedisUserSessionProvider provider =
+                  new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+              UserSessionModel us = provider.getUserSession(realm, userSessionId);
+              // Must not NPE when a live client session's parent user session is null.
+              return us.getAuthenticatedClientSessions().size();
+            });
+
+    assertThat(
+        "an orphaned client session (null parent) must be filtered, not NPE the read", size, is(0));
+  }
+
+  /**
+   * A read that finds a never-expiring live member {@code PERSIST}s the index Set (strips its TTL)
+   * so a finite TTL can't evict the immortal member. A later finite co-tenant write must then NOT
+   * re-stamp a TTL onto that persisted Set — {@code PEXPIREAT ... NX} fires on any TTL-less key,
+   * including a deliberately persisted one, and the finite horizon it stamps would later evict the
+   * whole Set (and the still-live never-expiring member) from by-index reads. The write-path
+   * backstop must {@code GT}-grow an already-existing Set, never re-establish a TTL on it (issue
+   * #78 review).
+   */
+  @Test
+  public void finiteCoTenantWriteDoesNotRefiniteizeAPersistedIndexSet() {
+    String userId =
+        withRealm(realmId, (s, realm) -> s.users().getUserByUsername(realm, "user1").getId());
+    String indexKey = ClusterTestSupport.userIndexKey(userId);
+
+    // A first session establishes the Set.
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          UserModel user = s.users().getUserByUsername(realm, "user1");
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+          provider.createUserSession(realm, user, "user1", "127.0.0.1", "form", true, null, null);
+          return null;
+        });
+    assertThat(ClusterTestSupport.members(jedis, indexKey), hasSize(1));
+
+    // Simulate the read-path having found a never-expiring live member and PERSISTed the Set.
+    jedis.persist(indexKey);
+    assertThat(
+        "precondition: the Set is persisted (no TTL)",
+        ClusterTestSupport.pttl(jedis, indexKey),
+        is(-1L));
+
+    // A finite co-tenant write to the SAME index Set must not stamp a TTL back onto it.
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          UserModel user = s.users().getUserByUsername(realm, "user1");
+          RedisUserSessionProvider provider =
+              new RedisUserSessionProvider(s, jedis, RedisMode.STANDALONE);
+          provider.createUserSession(realm, user, "user1", "127.0.0.1", "form", true, null, null);
+          return null;
+        });
+
+    assertThat(
+        "a finite co-tenant write must not re-finite-ize a persisted index Set (issue #78)",
+        ClusterTestSupport.pttl(jedis, indexKey),
+        is(-1L));
   }
 }

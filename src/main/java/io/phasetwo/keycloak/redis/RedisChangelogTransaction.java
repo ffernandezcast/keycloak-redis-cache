@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import lombok.extern.jbosslog.JBossLog;
+import org.keycloak.common.util.Time;
 import org.keycloak.models.AbstractKeycloakTransaction;
 import redis.clients.jedis.AbstractPipeline;
 import redis.clients.jedis.AbstractTransaction;
@@ -62,11 +63,6 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
   public RedisChangelogTransaction(
       String cacheName, UnifiedJedis jedis, AdapterSupplier<K, A> adapterSupplier) {
     this(cacheName, jedis, RedisMode.STANDALONE, adapterSupplier);
-  }
-
-  /** The Redis deployment mode this transaction writes for. */
-  public RedisMode getRedisMode() {
-    return redisMode;
   }
 
   /** Count an operation in metrics */
@@ -155,7 +151,13 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
         if (toDelete.containsKey(key)) continue;
         A model = cache.get(key);
         if (model != null) {
-          result.put(key, model);
+          // Match getIfPresent: a cached entry that has since expired must not be returned as live
+          // (expired() schedules its lazy delete). Otherwise the by-index read paths that resolve
+          // via getAll would treat an expired-but-cached member as live — skip reaping it and even
+          // extend the index Set's TTL to cover it (issue #78 review).
+          if (!expired(key, model)) {
+            result.put(key, model);
+          }
         } else {
           log.tracef("[redis] HGETALL %s", key.key());
           responses.put(key, pipeline.hgetAll(key.key()));
@@ -227,6 +229,31 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
             (a == PERSIST_INDEX_TTL || b == PERSIST_INDEX_TTL)
                 ? PERSIST_INDEX_TTL
                 : Math.max(a, b));
+  }
+
+  /**
+   * Fold the expirations of the live members a by-index read resolved into a single grow-only TTL
+   * extension on the index Set: {@code PERSIST} when any live member never expires (a {@code null}
+   * expiration), otherwise cover the longest-lived. Centralizes the identical fold the three
+   * by-index read paths previously duplicated (issue #78 review). Deferred to commit via {@link
+   * #extendIndexTtlOnCommit}.
+   */
+  public void extendIndexTtlToCoverLiveMembers(String indexKey, Collection<Long> liveExpirations) {
+    if (indexKey == null || liveExpirations == null) return;
+    boolean neverExpires = false;
+    Long maxExpiration = null;
+    for (Long expiration : liveExpirations) {
+      if (expiration == null) {
+        neverExpires = true;
+      } else if (maxExpiration == null || expiration > maxExpiration) {
+        maxExpiration = expiration;
+      }
+    }
+    if (neverExpires) {
+      extendIndexTtlOnCommit(indexKey, null);
+    } else if (maxExpiration != null) {
+      extendIndexTtlOnCommit(indexKey, maxExpiration);
+    }
   }
 
   @Override
@@ -440,6 +467,25 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
       expireAtMs = ((ExpirableEntity) model).getExpiration();
     }
 
+    // Read whether each index Set already exists BEFORE the SADD creates it, so the backstop can
+    // tell a fresh Set (establish the initial TTL) from a pre-existing one (grow-only; never
+    // re-finite-ize a Set a read PERSISTed for a never-expiring member) — issue #78 review. Batch
+    // the existence checks into a single pipelined round-trip instead of one blocking EXISTS per
+    // index, so a session write with several secondary indexes does not pay N serial round-trips on
+    // the hot write path; the pipeline is closed before the SADD MULTI opens, so only one pooled
+    // connection is held at a time.
+    Map<String, Boolean> alreadyExisted = Maps.newHashMapWithExpectedSize(validIndexes.size());
+    try (AbstractPipeline pipeline = jedis.pipelined()) {
+      Map<String, Response<Boolean>> existsResponses = Maps.newLinkedHashMap();
+      for (Map.Entry<String, String> index : validIndexes) {
+        existsResponses.computeIfAbsent(index.getKey(), pipeline::exists);
+      }
+      pipeline.sync();
+      for (Map.Entry<String, Response<Boolean>> e : existsResponses.entrySet()) {
+        alreadyExisted.put(e.getKey(), Boolean.TRUE.equals(e.getValue().get()));
+      }
+    }
+
     if (redisMode != RedisMode.CLUSTER) {
       // Standalone/sentinel keep atomic index maintenance: the SADD and its TTL backstop ride
       // inside the same MULTI/EXEC.
@@ -448,7 +494,8 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
           log.tracef("[redis] SADD %s %s", index.getKey(), index.getValue());
           txn.sadd(index.getKey(), index.getValue());
           countOperation(SADD);
-          applyIndexTtlBackstop(txn, index.getKey(), expireAtMs);
+          applyIndexTtlBackstop(
+              txn, index.getKey(), expireAtMs, alreadyExisted.get(index.getKey()));
         }
         txn.exec();
       }
@@ -459,23 +506,33 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
         log.tracef("[redis] SADD %s %s", index.getKey(), index.getValue());
         jedis.sadd(index.getKey(), index.getValue());
         countOperation(SADD);
-        applyIndexTtlBackstop(index.getKey(), expireAtMs);
+        applyIndexTtlBackstop(index.getKey(), expireAtMs, alreadyExisted.get(index.getKey()));
       }
     }
   }
 
   /**
    * Grow-only TTL backstop on an index Set, issued inside a {@code MULTI}/{@code EXEC}
-   * (non-cluster). Establish a TTL if the Set has none (NX), then only ever extend it (GT): Redis
-   * treats a key with no TTL as +infinity, so GT alone would never set the initial TTL on a
-   * freshly-created Set; NX handles the first write, GT keeps later writes grow-only so a
-   * shorter-lived session can't shrink a TTL already covering a longer-lived member of the same
-   * Set.
+   * (non-cluster). Establish a TTL only on a <em>fresh</em> Set ({@code NX}, when {@code
+   * alreadyExisted} is false — Redis treats a key with no TTL as +infinity, so {@code GT} alone
+   * would never set the initial TTL on a freshly-created Set); on any pre-existing Set use {@code
+   * GT} only, so a later finite write can neither shrink a longer-lived member's TTL nor
+   * re-finite-ize a Set a read deliberately {@code PERSIST}ed for a never-expiring member (issue
+   * #78 review — a naked {@code NX} fires on that persisted Set and its finite horizon would later
+   * evict the immortal member). Whether the Set existed is read <em>before</em> the {@code SADD}
+   * created it.
    */
-  private void applyIndexTtlBackstop(AbstractTransaction txn, String indexKey, Long expireAtMs) {
-    if (expireAtMs == null || expireAtMs <= 0L) return;
-    log.tracef("[redis] PEXPIREAT %s %s NX/GT", indexKey, expireAtMs);
-    txn.pexpireAt(indexKey, expireAtMs, ExpiryOption.NX);
+  private void applyIndexTtlBackstop(
+      AbstractTransaction txn, String indexKey, Long expireAtMs, boolean alreadyExisted) {
+    // Skip a null, non-positive, OR already-elapsed horizon. PEXPIREAT with a past epoch under NX
+    // sets an already-expired TTL on a Set that has none, which Redis executes as an immediate
+    // delete of the whole Set — evicting every live co-member. Never shrink; leave the existing
+    // TTL.
+    if (expireAtMs == null || expireAtMs <= Time.currentTimeMillis()) return;
+    log.tracef("[redis] PEXPIREAT %s %s %s/GT", indexKey, expireAtMs, alreadyExisted ? "" : "NX");
+    if (!alreadyExisted) {
+      txn.pexpireAt(indexKey, expireAtMs, ExpiryOption.NX);
+    }
     txn.pexpireAt(indexKey, expireAtMs, ExpiryOption.GT);
   }
 
@@ -483,10 +540,16 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
    * Grow-only TTL backstop on an index Set, issued directly (cluster). See the {@code txn}
    * overload.
    */
-  private void applyIndexTtlBackstop(String indexKey, Long expireAtMs) {
-    if (expireAtMs == null || expireAtMs <= 0L) return;
-    log.tracef("[redis] PEXPIREAT %s %s NX/GT", indexKey, expireAtMs);
-    jedis.pexpireAt(indexKey, expireAtMs, ExpiryOption.NX);
+  private void applyIndexTtlBackstop(String indexKey, Long expireAtMs, boolean alreadyExisted) {
+    // Skip a null, non-positive, OR already-elapsed horizon. PEXPIREAT with a past epoch under NX
+    // sets an already-expired TTL on a Set that has none, which Redis executes as an immediate
+    // delete of the whole Set — evicting every live co-member. Never shrink; leave the existing
+    // TTL.
+    if (expireAtMs == null || expireAtMs <= Time.currentTimeMillis()) return;
+    log.tracef("[redis] PEXPIREAT %s %s %s/GT", indexKey, expireAtMs, alreadyExisted ? "" : "NX");
+    if (!alreadyExisted) {
+      jedis.pexpireAt(indexKey, expireAtMs, ExpiryOption.NX);
+    }
     jedis.pexpireAt(indexKey, expireAtMs, ExpiryOption.GT);
   }
 
@@ -510,8 +573,15 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
           txn.exec();
         }
       } else {
+        // Cluster: issue per-key and catch per-key, so a transient single-shard failure (MOVED,
+        // connection drop) cannot abort the remaining extensions the way one outer catch would —
+        // matching reapStaleIndexMembers' cluster branch.
         for (Map.Entry<String, Long> e : extensions.entrySet()) {
-          applyIndexTtlExtension(e.getKey(), e.getValue());
+          try {
+            applyIndexTtlExtension(e.getKey(), e.getValue());
+          } catch (Exception ex) {
+            log.warnf(ex, "Failed to extend TTL on index %s", e.getKey());
+          }
         }
       }
     } catch (Exception e) {
@@ -524,10 +594,16 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
     if (coverUntilMs == PERSIST_INDEX_TTL) {
       log.tracef("[redis] PERSIST %s (live member never expires)", indexKey);
       txn.persist(indexKey);
-    } else {
-      log.tracef("[redis] PEXPIREAT %s %s NX/GT (cover live member)", indexKey, coverUntilMs);
-      txn.pexpireAt(indexKey, coverUntilMs, ExpiryOption.NX);
+    } else if (coverUntilMs > Time.currentTimeMillis()) {
+      // GT-only: a read never creates the Set, so it must only grow an existing TTL, never
+      // establish one. Establishing (NX) on a TTL-less Set would re-finite-ize a Set persisted for
+      // a never-expiring member (issue #78 review); GT is a no-op on a persisted (+inf) Set.
+      log.tracef("[redis] PEXPIREAT %s %s GT (cover live member)", indexKey, coverUntilMs);
       txn.pexpireAt(indexKey, coverUntilMs, ExpiryOption.GT);
+    } else {
+      // The member was live at read time but its horizon has already elapsed by commit; skip it.
+      // The member is expiring anyway and the reap path handles it.
+      log.tracef("[redis] skip PEXPIREAT %s: horizon %s already elapsed", indexKey, coverUntilMs);
     }
   }
 
@@ -536,10 +612,16 @@ public class RedisChangelogTransaction<K extends Key, A extends MapEntity<K>>
     if (coverUntilMs == PERSIST_INDEX_TTL) {
       log.tracef("[redis] PERSIST %s (live member never expires)", indexKey);
       jedis.persist(indexKey);
-    } else {
-      log.tracef("[redis] PEXPIREAT %s %s NX/GT (cover live member)", indexKey, coverUntilMs);
-      jedis.pexpireAt(indexKey, coverUntilMs, ExpiryOption.NX);
+    } else if (coverUntilMs > Time.currentTimeMillis()) {
+      // GT-only: a read never creates the Set, so it must only grow an existing TTL, never
+      // establish one. Establishing (NX) on a TTL-less Set would re-finite-ize a Set persisted for
+      // a never-expiring member (issue #78 review); GT is a no-op on a persisted (+inf) Set.
+      log.tracef("[redis] PEXPIREAT %s %s GT (cover live member)", indexKey, coverUntilMs);
       jedis.pexpireAt(indexKey, coverUntilMs, ExpiryOption.GT);
+    } else {
+      // The member was live at read time but its horizon has already elapsed by commit; skip it.
+      // The member is expiring anyway and the reap path handles it.
+      log.tracef("[redis] skip PEXPIREAT %s: horizon %s already elapsed", indexKey, coverUntilMs);
     }
   }
 

@@ -19,6 +19,7 @@ package io.phasetwo.keycloak.redis.testsuite.session;
 import io.phasetwo.keycloak.redis.RedisHashCas;
 import java.net.ServerSocket;
 import java.util.Set;
+import lombok.extern.jbosslog.JBossLog;
 import org.junit.Assert;
 import org.testcontainers.containers.Container;
 import org.testcontainers.containers.FixedHostPortGenericContainer;
@@ -47,6 +48,7 @@ import redis.clients.jedis.UnifiedJedis;
  * of the underlying session hashes — leaving <em>dangling</em> index members — without hardcoding
  * any entity-key format: it reads the Set and {@code DEL}s each member key.
  */
+@JBossLog
 public final class ClusterTestSupport {
 
   private ClusterTestSupport() {}
@@ -69,9 +71,32 @@ public final class ClusterTestSupport {
   /**
    * Starts a deterministic single-node Valkey cluster, connects a {@link RedisClusterClient},
    * verifies the client is genuinely cluster-mode, and loads the CAS Lua script.
+   *
+   * <p>Binding a fixed host port is inherently racy: {@link #findFreePort()} releases the probe
+   * socket before {@code withFixedExposedPort} rebinds it, so another process can grab the port in
+   * between and container start-up fails. Rather than fail the suite, retry a handful of times with
+   * a freshly probed port each attempt — the window is tiny, so a couple of retries make it
+   * effectively deterministic.
    */
-  @SuppressWarnings("deprecation")
   public static Handle start() throws Exception {
+    Exception last = null;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+      try {
+        return startOnce();
+      } catch (Exception e) {
+        last = e;
+        log.warnf(
+            e,
+            "Cluster container start-up failed (attempt %d/5), retrying on a fresh port",
+            attempt);
+      }
+    }
+    throw new IllegalStateException(
+        "Could not start a single-node Valkey cluster after 5 attempts", last);
+  }
+
+  @SuppressWarnings("deprecation")
+  private static Handle startOnce() throws Exception {
     int port = findFreePort();
 
     FixedHostPortGenericContainer<?> container =
@@ -96,42 +121,49 @@ public final class ClusterTestSupport {
             .waitingFor(Wait.forLogMessage(".*Ready to accept connections.*", 1));
     container.start();
 
-    // Assign every hash slot to the single node so the cluster reaches the 'ok' state.
-    container.execInContainer("valkey-cli", "cluster", "addslotsrange", "0", "16383");
+    // Everything past start() must clean up the running container if it throws, so a retried
+    // attempt (see start()) doesn't leak a container holding the port.
+    try {
+      // Assign every hash slot to the single node so the cluster reaches the 'ok' state.
+      container.execInContainer("valkey-cli", "cluster", "addslotsrange", "0", "16383");
 
-    // Wait for the cluster to report a healthy state before connecting.
-    boolean ready = false;
-    for (int i = 0; i < 40 && !ready; i++) {
-      Container.ExecResult info = container.execInContainer("valkey-cli", "cluster", "info");
-      ready = info.getStdout().contains("cluster_state:ok");
-      if (!ready) {
-        Thread.sleep(500);
+      // Wait for the cluster to report a healthy state before connecting.
+      boolean ready = false;
+      for (int i = 0; i < 40 && !ready; i++) {
+        Container.ExecResult info = container.execInContainer("valkey-cli", "cluster", "info");
+        ready = info.getStdout().contains("cluster_state:ok");
+        if (!ready) {
+          Thread.sleep(500);
+        }
       }
+      if (!ready) {
+        throw new IllegalStateException("Valkey cluster did not reach state 'ok' in time");
+      }
+
+      JedisClientConfig clientConfig =
+          DefaultJedisClientConfig.builder()
+              .connectionTimeoutMillis(5000)
+              .socketTimeoutMillis(5000)
+              .build();
+      UnifiedJedis jedis =
+          RedisClusterClient.builder()
+              .nodes(Set.of(new HostAndPort("127.0.0.1", port)))
+              .clientConfig(clientConfig)
+              .build();
+
+      // Sanity check: topology is discovered and pipelining yields a genuine ClusterPipeline.
+      Assert.assertTrue(
+          "Expected a cluster-mode client whose pipeline is a ClusterPipeline",
+          jedis.pipelined() instanceof redis.clients.jedis.ClusterPipeline);
+
+      // Load the CAS Lua script onto the cluster node used by the provider's write path.
+      RedisHashCas.initialize(jedis);
+
+      return new Handle(container, jedis, port);
+    } catch (Exception e) {
+      container.stop();
+      throw e;
     }
-    if (!ready) {
-      throw new IllegalStateException("Valkey cluster did not reach state 'ok' in time");
-    }
-
-    JedisClientConfig clientConfig =
-        DefaultJedisClientConfig.builder()
-            .connectionTimeoutMillis(5000)
-            .socketTimeoutMillis(5000)
-            .build();
-    UnifiedJedis jedis =
-        RedisClusterClient.builder()
-            .nodes(Set.of(new HostAndPort("127.0.0.1", port)))
-            .clientConfig(clientConfig)
-            .build();
-
-    // Sanity check: topology is discovered and pipelining yields a genuine ClusterPipeline.
-    Assert.assertTrue(
-        "Expected a cluster-mode client whose pipeline is a ClusterPipeline",
-        jedis.pipelined() instanceof redis.clients.jedis.ClusterPipeline);
-
-    // Load the CAS Lua script onto the cluster node used by the provider's write path.
-    RedisHashCas.initialize(jedis);
-
-    return new Handle(container, jedis, port);
   }
 
   /** Closes the client and stops the container; null-safe. */

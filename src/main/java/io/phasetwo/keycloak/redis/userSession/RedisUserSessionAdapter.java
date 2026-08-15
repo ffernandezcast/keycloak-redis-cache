@@ -90,6 +90,17 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
           live.add(cs);
         }
       }
+      // Grow the parent-index Set TTL to cover its longest-lived live member (or PERSIST when a
+      // live member never expires), exactly as the provider's user-index/client-index read paths do
+      // (issue #78, review finding A). The Set's TTL is stamped on write from whichever client
+      // session last touched it, so a longer-lived client session that is never re-written could be
+      // stranded under a shorter co-tenant's TTL and silently dropped from the parent-index; reads
+      // must push it back up. Deferred to commit — never written on the read path.
+      clientSessionTrx.extendIndexTtlToCoverLiveMembers(
+          indexKey,
+          live.stream()
+              .map(RedisAuthenticatedClientSessionAdapter::getExpiration)
+              .collect(Collectors.toList()));
       clientSessions =
           live.stream()
               .filter(this::filterAndRemoveExpiredClientSessions)
@@ -117,10 +128,13 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
 
   private boolean matchingOfflineFlag(
       RedisAuthenticatedClientSessionAdapter redisAuthenticatedClientSessionAdapter) {
-    boolean isClientSessionOffline =
-        redisAuthenticatedClientSessionAdapter.getUserSession().isOffline();
+    UserSessionModel clientUserSession = redisAuthenticatedClientSessionAdapter.getUserSession();
+    // A client session whose parent user session has expired/vanished is orphaned:
+    // getUserSession() returns null. Treat it as non-matching (filtered out) rather than
+    // dereferencing null (issue #78 review) — it cannot belong to this user session's view.
+    if (clientUserSession == null) return false;
 
-    return isOffline() == isClientSessionOffline;
+    return isOffline() == clientUserSession.isOffline();
   }
 
   private boolean filterAndRemoveExpiredClientSessions(

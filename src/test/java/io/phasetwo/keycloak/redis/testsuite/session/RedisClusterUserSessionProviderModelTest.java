@@ -109,6 +109,10 @@ public class RedisClusterUserSessionProviderModelTest extends KeycloakModelTest 
     RealmModel realm = s.realms().getRealm(realmId);
     s.getContext().setRealm(realm);
     s.realms().removeRealm(realmId);
+    // Flush the shared single-node cluster between methods so index Sets and session hashes don't
+    // accumulate across tests: removeRealm drives the factory provider's own Valkey, not this
+    // clusterJedis. Mirrors the standalone suites.
+    clusterJedis.flushAll();
   }
 
   /**
