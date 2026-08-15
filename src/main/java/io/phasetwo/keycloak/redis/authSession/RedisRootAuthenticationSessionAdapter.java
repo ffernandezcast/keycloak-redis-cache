@@ -181,10 +181,13 @@ public class RedisRootAuthenticationSessionAdapter extends MapEntity<RootAuthent
     adapter.setClientUuid(client.getId());
     adapter.setParentSession(this);
     adapter.setTimestamp(timestamp);
+    long exp = timestamp + TimeAdapter.fromSecondsToMilliseconds(authSessionLifespanSeconds);
+    // Give the child auth-session hash the same TTL backstop as its root; without it the
+    // auth-session:* keys never expire and leak unbounded (issue #78).
+    adapter.setExpiration(exp);
     log.tracef("created authSession %s", adapter);
 
     setTimestampLong(timestamp);
-    long exp = timestamp + TimeAdapter.fromSecondsToMilliseconds(authSessionLifespanSeconds);
     setExpiration(exp);
 
     getAuthenticationSessions().put(tabId, adapter);
