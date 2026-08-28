@@ -120,17 +120,26 @@ public class RedisRootAuthenticationSessionAdapter extends MapEntity<RootAuthent
     Set<String> strIds = jedis.smembers(indexKey);
     if (strIds != null && !strIds.isEmpty()) {
       Map<String, AuthenticationSessionModel> sessions = new HashMap<>();
+      List<Long> liveExpirations = new ArrayList<>();
       for (String rawId : strIds) {
         AuthenticationSessionKey key = AuthenticationSessionKey.fromString(rawId);
         RedisAuthenticationSessionAdapter session = authSessionTrx.getIfPresent(key);
         if (session == null) {
+          // A child whose hash has TTL-expired/vanished is a dangling parent-index member. Reap it
+          // at commit so this index self-heals like the other by-index read paths (issue #78);
+          // previously it was only skipped, so stale members leaked on an actively-used root.
           log.tracef(
-              "Ignoring stale auth-session parent index entry for rootSession=%s child=%s",
+              "Reaping stale auth-session parent index entry for rootSession=%s child=%s",
               getId(), rawId);
+          authSessionTrx.reapIndexMemberOnCommit(indexKey, rawId);
           continue;
         }
+        liveExpirations.add(session.getExpiration());
         sessions.put(key.tabId(), session);
       }
+      // Grow the parent-index Set TTL to cover its longest-lived live child (or PERSIST when one
+      // never expires), matching the user/client index read paths (issue #78).
+      authSessionTrx.extendIndexTtlToCoverLiveMembers(indexKey, liveExpirations);
       return sessions;
     }
 
@@ -181,11 +190,25 @@ public class RedisRootAuthenticationSessionAdapter extends MapEntity<RootAuthent
     adapter.setClientUuid(client.getId());
     adapter.setParentSession(this);
     adapter.setTimestamp(timestamp);
+    long exp = timestamp + TimeAdapter.fromSecondsToMilliseconds(authSessionLifespanSeconds);
+    // Give the child auth-session hash the same TTL backstop as its root; without it the
+    // auth-session:* keys never expire and leak unbounded (issue #78).
+    adapter.setExpiration(exp);
     log.tracef("created authSession %s", adapter);
 
     setTimestampLong(timestamp);
-    long exp = timestamp + TimeAdapter.fromSecondsToMilliseconds(authSessionLifespanSeconds);
     setExpiration(exp);
+    // Re-stamp the pre-existing sibling children with the same horizon. Since #78 gave each child
+    // its own native TTL, bumping only the root (and the new child) would let an earlier
+    // still-active sibling expire before the refreshed root and vanish mid-flow. Mirror
+    // removeAuthenticationSessionByTabId / restartSession (issue #78 review).
+    if (authSessions != null) {
+      for (AuthenticationSessionModel sibling : authSessions.values()) {
+        if (sibling instanceof RedisAuthenticationSessionAdapter siblingAdapter) {
+          siblingAdapter.setExpiration(exp);
+        }
+      }
+    }
 
     getAuthenticationSessions().put(tabId, adapter);
 
@@ -209,6 +232,16 @@ public class RedisRootAuthenticationSessionAdapter extends MapEntity<RootAuthent
       int authSessionLifespanSeconds = getAuthSessionLifespan(realm);
       long exp = timestamp + TimeAdapter.fromSecondsToMilliseconds(authSessionLifespanSeconds);
       setExpiration(exp);
+      // Re-stamp the surviving child auth-session hashes with the same horizon. Since #78 gave each
+      // child its own native TTL, bumping only the root would let a still-active child expire
+      // before
+      // its refreshed root and vanish mid-flow; keep every child TTL at least as long as the
+      // root's.
+      for (AuthenticationSessionModel child : authSessions.values()) {
+        if (child instanceof RedisAuthenticationSessionAdapter adapter) {
+          adapter.setExpiration(exp);
+        }
+      }
     }
   }
 
@@ -231,7 +264,13 @@ public class RedisRootAuthenticationSessionAdapter extends MapEntity<RootAuthent
       removeAuthenticationSession(entry.getValue());
       iterator.remove();
     }
-    setTimestamp(Time.currentTime());
+    // Refresh the root's TTL backstop on restart. #78 gave the root a native expiration; resetting
+    // only the timestamp would leave the just-restarted root hash under its old (possibly imminent)
+    // expiration horizon and let it vanish mid-flow. Mirror removeAuthenticationSessionByTabId.
+    long timestamp = Time.currentTimeMillis();
+    setTimestampLong(timestamp);
+    int authSessionLifespanSeconds = getAuthSessionLifespan(realm);
+    setExpiration(timestamp + TimeAdapter.fromSecondsToMilliseconds(authSessionLifespanSeconds));
   }
 
   private String generateTabId() {

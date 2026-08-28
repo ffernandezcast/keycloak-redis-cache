@@ -1,6 +1,7 @@
 package io.phasetwo.keycloak.redis.authSession;
 
 import com.google.common.collect.ImmutableMap;
+import io.phasetwo.keycloak.common.ExpirableEntity;
 import io.phasetwo.keycloak.redis.MapEntity;
 import java.util.Map;
 import java.util.Set;
@@ -15,7 +16,7 @@ import org.keycloak.sessions.RootAuthenticationSessionModel;
 
 @JBossLog
 public class RedisAuthenticationSessionAdapter extends MapEntity<AuthenticationSessionKey>
-    implements AuthenticationSessionModel {
+    implements AuthenticationSessionModel, ExpirableEntity {
 
   private final KeycloakSession session;
 
@@ -69,6 +70,17 @@ public class RedisAuthenticationSessionAdapter extends MapEntity<AuthenticationS
 
   public long getTimestamp() {
     return getLong("timestamp", 0);
+  }
+
+  @Override
+  public Long getExpiration() {
+    if (isNull("expiration")) return null;
+    return getLong("expiration", 0L);
+  }
+
+  @Override
+  public void setExpiration(Long expiration) {
+    setField("expiration", expiration);
   }
 
   @Override

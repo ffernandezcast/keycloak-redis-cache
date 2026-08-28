@@ -4,6 +4,7 @@ import static io.phasetwo.keycloak.common.ExpirationUtils.isExpired;
 import static io.phasetwo.keycloak.redis.userSession.expiration.RedisSessionExpiration.setUserSessionExpiration;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import io.phasetwo.keycloak.common.ExpirableEntity;
@@ -11,8 +12,8 @@ import io.phasetwo.keycloak.redis.MapEntity;
 import io.phasetwo.keycloak.redis.RedisChangelogTransaction;
 import io.phasetwo.keycloak.redis.userSession.expiration.SessionExpirationData;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 import lombok.extern.jbosslog.JBossLog;
@@ -76,11 +77,32 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
     log.tracef("[redis] SMEMBERS %s", indexKey);
     Set<String> strIds = jedis.smembers(indexKey);
     if (strIds != null && !strIds.isEmpty()) {
+      // Resolve members; a member whose client-session hash has expired/vanished is dangling and is
+      // registered for reap-at-commit so the parent-index self-heals without writing on the read
+      // path, in every mode (issue #78).
+      List<RedisAuthenticatedClientSessionAdapter> live = Lists.newArrayList();
+      for (String strId : strIds) {
+        RedisAuthenticatedClientSessionAdapter cs =
+            clientSessionTrx.getIfPresent(AuthenticatedClientSessionKey.fromString(strId));
+        if (cs == null) {
+          clientSessionTrx.reapIndexMemberOnCommit(indexKey, strId);
+        } else {
+          live.add(cs);
+        }
+      }
+      // Grow the parent-index Set TTL to cover its longest-lived live member (or PERSIST when a
+      // live member never expires), exactly as the provider's user-index/client-index read paths do
+      // (issue #78, review finding A). The Set's TTL is stamped on write from whichever client
+      // session last touched it, so a longer-lived client session that is never re-written could be
+      // stranded under a shorter co-tenant's TTL and silently dropped from the parent-index; reads
+      // must push it back up. Deferred to commit — never written on the read path.
+      clientSessionTrx.extendIndexTtlToCoverLiveMembers(
+          indexKey,
+          live.stream()
+              .map(RedisAuthenticatedClientSessionAdapter::getExpiration)
+              .collect(Collectors.toList()));
       clientSessions =
-          strIds.stream()
-              .map(AuthenticatedClientSessionKey::fromString)
-              .map(clientSessionTrx::getIfPresent)
-              .filter(Objects::nonNull)
+          live.stream()
               .filter(this::filterAndRemoveExpiredClientSessions)
               .filter(this::matchingOfflineFlag)
               .filter(this::filterAndRemoveClientSessionWithoutClient)
@@ -106,10 +128,13 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
 
   private boolean matchingOfflineFlag(
       RedisAuthenticatedClientSessionAdapter redisAuthenticatedClientSessionAdapter) {
-    boolean isClientSessionOffline =
-        redisAuthenticatedClientSessionAdapter.getUserSession().isOffline();
+    UserSessionModel clientUserSession = redisAuthenticatedClientSessionAdapter.getUserSession();
+    // A client session whose parent user session has expired/vanished is orphaned:
+    // getUserSession() returns null. Treat it as non-matching (filtered out) rather than
+    // dereferencing null (issue #78 review) — it cannot belong to this user session's view.
+    if (clientUserSession == null) return false;
 
-    return isOffline() == isClientSessionOffline;
+    return isOffline() == clientUserSession.isOffline();
   }
 
   private boolean filterAndRemoveExpiredClientSessions(
