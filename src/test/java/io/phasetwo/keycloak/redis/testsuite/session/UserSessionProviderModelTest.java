@@ -23,6 +23,7 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.junit.Assert.*;
 
 import io.phasetwo.keycloak.redis.testsuite.KeycloakModelTest;
+import io.phasetwo.keycloak.redis.userSession.RedisAuthenticatedClientSessionAdapter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -127,6 +128,41 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
 
           userSession = session.sessions().getUserSession(realm, origSessions[1].getId());
           Assert.assertNull(userSession);
+        });
+  }
+
+  /**
+   * Regression for issue #81: {@code RedisAuthenticatedClientSessionAdapter.setTimestamp} must not
+   * throw an {@link NullPointerException} when the parent user session has expired/vanished and
+   * {@code getUserSession()} therefore returns {@code null} (e.g. a token refresh on an orphaned
+   * client session). An orphaned client session has no parent to tell us whether it was offline, so
+   * the expiration must still be computed (online-style) rather than failing the write.
+   */
+  @Test
+  public void testSetTimestampWithOrphanedParentDoesNotThrow() {
+    final String parentId = KeycloakModelUtils.generateId(); // no such user session exists
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          ClientModel client = realm.getClientByClientId("test-app");
+
+          Map<String, String> orphanData = new HashMap<>();
+          orphanData.put("id", parentId + "::" + client.getId());
+          orphanData.put("parentId", parentId);
+          orphanData.put("realmId", realmId);
+          orphanData.put("clientUuid", client.getId());
+          orphanData.put("timestamp", String.valueOf(Time.currentTime()));
+          orphanData.put("offline", "false");
+
+          RedisAuthenticatedClientSessionAdapter orphan =
+              new RedisAuthenticatedClientSessionAdapter(session, orphanData.get("id"), orphanData);
+
+          // Must not throw despite getUserSession() resolving to null.
+          orphan.setTimestamp(Time.currentTime());
+
+          assertNotNull("an orphaned client session must still receive an expiration", orphan.getExpiration());
+          return null;
         });
   }
 
