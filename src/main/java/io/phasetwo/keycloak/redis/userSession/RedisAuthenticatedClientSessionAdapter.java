@@ -108,12 +108,17 @@ public class RedisAuthenticatedClientSessionAdapter extends MapEntity<Authentica
   @Override
   public void setTimestamp(int timestamp) {
     setField("timestamp", timestamp);
-    var data = (RedisUserSessionAdapter) this.getUserSession();
+    RedisUserSessionAdapter data = (RedisUserSessionAdapter) this.getUserSession();
+    // A client session whose parent user session has expired/vanished is orphaned:
+    // getUserSession() returns null. Resolve the offline flag defensively rather than
+    // dereferencing null — an orphan cannot tell us whether it was offline, so fall back to
+    // online-style expiration (issue #81).
+    Boolean offline = data != null ? data.isOffline() : null;
     setClientSessionExpiration(
         this,
         SessionExpirationData.builder().realm(getRealm()).build(),
         getClient(),
-        data.isOffline());
+        offline);
   }
 
   @Override
