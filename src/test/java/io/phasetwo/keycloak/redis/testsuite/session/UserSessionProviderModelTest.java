@@ -166,6 +166,41 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
         });
   }
 
+  /**
+   * Regression for issue #81: {@code RedisAuthenticatedClientSessionAdapter.setTimestamp} must not
+   * throw when the client is missing even though the parent user session still exists (a stale
+   * client session whose client was deleted). {@code getUserSession()} is non-null here, but
+   * {@code getClient()} resolves to {@code null}, and the offline expiration computation
+   * dereferences the client. The write must be skipped, not fail with a {@link
+   * NullPointerException}.
+   */
+  @Test
+  public void testSetTimestampWithMissingClientDoesNotThrow() {
+    final String missingClientUuid = KeycloakModelUtils.generateId(); // no such client exists
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          // A real, existing user session so getUserSession() resolves to non-null.
+          UserSessionModel userSession = createSessions(session, realmId)[0];
+
+          Map<String, String> orphanData = new HashMap<>();
+          orphanData.put("id", userSession.getId() + "::" + missingClientUuid);
+          orphanData.put("parentId", userSession.getId());
+          orphanData.put("realmId", realmId);
+          orphanData.put("clientUuid", missingClientUuid);
+          orphanData.put("timestamp", String.valueOf(Time.currentTime()));
+          orphanData.put("offline", "false");
+
+          RedisAuthenticatedClientSessionAdapter orphan =
+              new RedisAuthenticatedClientSessionAdapter(session, orphanData.get("id"), orphanData);
+
+          // Must not throw despite getClient() resolving to null.
+          orphan.setTimestamp(Time.currentTime());
+          return null;
+        });
+  }
+
   @Test
   // @Ignore("multiple transactions")
   public void testExpiredClientSessions() {

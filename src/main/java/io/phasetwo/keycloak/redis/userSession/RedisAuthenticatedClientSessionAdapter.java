@@ -108,6 +108,13 @@ public class RedisAuthenticatedClientSessionAdapter extends MapEntity<Authentica
   @Override
   public void setTimestamp(int timestamp) {
     setField("timestamp", timestamp);
+    ClientModel client = getClient();
+    // A client session whose client has been deleted cannot have its expiration computed (the
+    // offline-expiration path dereferences the client). Skip rather than failing the write — the
+    // read path already drops client sessions without a client (issue #81).
+    if (client == null) {
+      return;
+    }
     RedisUserSessionAdapter data = (RedisUserSessionAdapter) this.getUserSession();
     // A client session whose parent user session has expired/vanished is orphaned:
     // getUserSession() returns null. Resolve the offline flag defensively rather than
@@ -117,7 +124,7 @@ public class RedisAuthenticatedClientSessionAdapter extends MapEntity<Authentica
     setClientSessionExpiration(
         this,
         SessionExpirationData.builder().realm(getRealm()).build(),
-        getClient(),
+        client,
         offline);
   }
 
