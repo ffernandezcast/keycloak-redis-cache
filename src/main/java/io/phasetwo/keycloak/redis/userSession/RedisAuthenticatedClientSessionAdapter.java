@@ -47,7 +47,14 @@ public class RedisAuthenticatedClientSessionAdapter extends MapEntity<Authentica
 
   @Override
   public void detachFromUserSession() {
-    getUserSession().removeAuthenticatedClientSessions(Collections.singleton(getClientUuid()));
+    // A client session whose parent user session has expired/vanished is orphaned:
+    // getUserSession() returns null. There is no parent to detach from, so treat it as a no-op
+    // rather than failing a revoke/logout with an NPE (issue #81).
+    UserSessionModel parent = getUserSession();
+    if (parent == null) {
+      return;
+    }
+    parent.removeAuthenticatedClientSessions(Collections.singleton(getClientUuid()));
   }
 
   @Override

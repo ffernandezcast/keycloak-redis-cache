@@ -201,6 +201,39 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
         });
   }
 
+  /**
+   * Regression for issue #81: {@code RedisAuthenticatedClientSessionAdapter.detachFromUserSession}
+   * must not throw when the parent user session is missing (an orphaned client session whose
+   * parent hash expired/vanished). It dereferences {@code getUserSession()} directly, which returns
+   * {@code null} for an orphan — the same defect fixed in {@code setTimestamp} (#83). A revoke or
+   * logout on an orphaned client session must not NPE.
+   */
+  @Test
+  public void testDetachFromUserSessionWithOrphanedParentDoesNotThrow() {
+    final String parentId = KeycloakModelUtils.generateId(); // no such user session exists
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          ClientModel client = realm.getClientByClientId("test-app");
+
+          Map<String, String> orphanData = new HashMap<>();
+          orphanData.put("id", parentId + "::" + client.getId());
+          orphanData.put("parentId", parentId);
+          orphanData.put("realmId", realmId);
+          orphanData.put("clientUuid", client.getId());
+          orphanData.put("timestamp", String.valueOf(Time.currentTime()));
+          orphanData.put("offline", "false");
+
+          RedisAuthenticatedClientSessionAdapter orphan =
+              new RedisAuthenticatedClientSessionAdapter(session, orphanData.get("id"), orphanData);
+
+          // Must not throw despite getUserSession() resolving to null.
+          orphan.detachFromUserSession();
+          return null;
+        });
+  }
+
   @Test
   // @Ignore("multiple transactions")
   public void testExpiredClientSessions() {
