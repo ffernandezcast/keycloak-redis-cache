@@ -342,6 +342,42 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
   }
 
   /**
+   * Regression for issue #81: {@code getRefreshTokenUseCount} reaches the realm through {@code
+   * session.realms().getRealm(getRealmId())} directly rather than through {@code getRealm()}, so
+   * the null-realm guard on the other entry points does not cover it. Keycloak calls it on every
+   * refresh when {@code revokeRefreshToken} is enabled, and client sessions are handed out by the
+   * client index with a {@code realmId} read straight off the hash — no cross-check against a realm
+   * the caller already resolved.
+   *
+   * <p>Without a realm the reuse interval is unknowable, so the refresh must be counted rather than
+   * discounted: erring toward revoking on reuse is the safe direction.
+   */
+  @Test
+  public void testGetRefreshTokenUseCountWithUnresolvableRealmDoesNotThrow() {
+    final String goneRealmId = KeycloakModelUtils.generateId(); // no such realm exists
+    final String reuseId = "reuse-1";
+
+    inComittedTransaction(
+        session -> {
+          RedisAuthenticatedClientSessionAdapter stranded =
+              clientSessionReferring(
+                  session,
+                  goneRealmId,
+                  KeycloakModelUtils.generateId(),
+                  KeycloakModelUtils.generateId());
+
+          // Sets both the use-count and the last-use notes, which is what takes the realm branch.
+          stranded.setRefreshTokenUseCount(reuseId, 3);
+
+          assertEquals(
+              "an unresolvable realm must not discount the refresh, and must not throw",
+              3,
+              stranded.getRefreshTokenUseCount(reuseId));
+          return null;
+        });
+  }
+
+  /**
    * Regression for issue #81: {@code getUserSession()} must resolve <em>this</em> client session's
    * parent, not the offline sibling of a vanished online parent.
    *

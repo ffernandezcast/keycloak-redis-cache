@@ -261,12 +261,12 @@ public class RedisAuthenticatedClientSessionAdapter extends MapEntity<Authentica
     }
 
     long lastUseTimestamp = Long.parseLong(lastUseTimestampString);
-    if (lastUseTimestamp
-        > Time.currentTimeMillis()
-            - session
-                .realms()
-                .getRealm(getRealmId())
-                .getAttribute("refreshTokenReuseInterval", 0L)) {
+    RealmModel realm = getRealm();
+    // Without a realm the reuse interval is unknowable. Fall back to its own default of 0, which
+    // counts the refresh rather than discounting it: erring toward revoking on reuse is the safe
+    // direction, and Keycloak calls this on every refresh when revokeRefreshToken is on (#81).
+    long reuseInterval = realm == null ? 0L : realm.getAttribute("refreshTokenReuseInterval", 0L);
+    if (lastUseTimestamp > Time.currentTimeMillis() - reuseInterval) {
       return Math.max(0, Integer.parseInt(currentCount) - 1); // do not count refresh
     }
 
