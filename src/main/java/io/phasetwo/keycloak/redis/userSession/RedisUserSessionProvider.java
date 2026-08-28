@@ -91,7 +91,12 @@ public class RedisUserSessionProvider implements UserSessionProvider {
 
     RedisAuthenticatedClientSessionAdapter entity =
         createAuthenticatedClientSessionEntityInstance(
-            null, userSession.getId(), realm.getId(), client.getId(), isTransient(userSession));
+            null,
+            userSession.getId(),
+            realm.getId(),
+            client.getId(),
+            isTransient(userSession),
+            false);
 
     String started = String.valueOf(entity.getTimestamp());
     entity.setNote(AuthenticatedClientSessionModel.STARTED_AT_NOTE, started);
@@ -107,6 +112,20 @@ public class RedisUserSessionProvider implements UserSessionProvider {
 
     userSessionEntity.getAuthenticatedClientSessions().put(client.getId(), entity);
     return entity;
+  }
+
+  /**
+   * Registers a client session for deletion at commit, addressed by its key.
+   *
+   * <p>Used by {@link RedisAuthenticatedClientSessionAdapter#detachFromUserSession()} for an
+   * orphan, which has no parent to delegate the removal to. Resolving the key through the
+   * transaction first matters: only the instance the transaction has cached is honoured at commit,
+   * and the caller is not necessarily holding it (issue #81).
+   */
+  void removeClientSession(RedisAuthenticatedClientSessionAdapter clientSession) {
+    RedisAuthenticatedClientSessionAdapter cached =
+        clientSessionTrx.getIfPresent(clientSession.getKey());
+    clientSessionTrx.addForDelete(cached != null ? cached : clientSession);
   }
 
   /** Convert the UserSessionModel to a RedisUserSessionAdapter or load it from the transaction */
@@ -681,9 +700,9 @@ public class RedisUserSessionProvider implements UserSessionProvider {
     if (userSessionEntity.isPresent()) {
       RedisUserSessionAdapter userSession = userSessionEntity.get();
       String clientId = clientSession.getClient().getId();
-      var authenticatedClientSessions = userSession.getAuthenticatedClientSessionByClient(clientId);
-      if (authenticatedClientSessions != null) {
-        userSession.removeAuthenticatedClientSessions(List.of(authenticatedClientSessions.getId()));
+      if (userSession.getAuthenticatedClientSessionByClient(clientId) != null) {
+        // Keyed on the client UUID, not the client-session id -- compare the online path above.
+        userSession.removeAuthenticatedClientSessions(List.of(clientId));
       }
 
       userSession.addAuthenticatedClientSession(clientSessionEntity);
@@ -906,7 +925,12 @@ public class RedisUserSessionProvider implements UserSessionProvider {
   }
 
   private RedisAuthenticatedClientSessionAdapter createAuthenticatedClientSessionEntityInstance(
-      String id, String userSessionId, String realmId, String clientId, boolean stateTransient) {
+      String id,
+      String userSessionId,
+      String realmId,
+      String clientId,
+      boolean stateTransient,
+      boolean offline) {
     int timestamp = Time.currentTime();
     id = id == null ? createAuthenticatedClientId(userSessionId, clientId) : id;
     RedisAuthenticatedClientSessionAdapter entity =
@@ -914,6 +938,10 @@ public class RedisUserSessionProvider implements UserSessionProvider {
     entity.setRealmId(realmId);
     entity.setClientUuid(clientId);
     entity.setParentId(userSessionId);
+    // Both create paths know the literal value, so store it instead of making every later read ask
+    // a parent user session that may be gone by then (issue #81). Set before setTimestamp(), which
+    // uses it to pick the expiration branch.
+    entity.setOffline(offline);
     entity.setTimestamp(timestamp);
     entity.setNotes(new HashMap<>());
     if (stateTransient) {
@@ -934,7 +962,8 @@ public class RedisUserSessionProvider implements UserSessionProvider {
             offlineUserSession.getId(),
             clientSession.getRealm().getId(),
             clientSession.getClient().getId(),
-            isTransient(offlineUserSession));
+            isTransient(offlineUserSession),
+            true);
     entity.setAction(clientSession.getAction());
     entity.setProtocol(clientSession.getProtocol());
     entity.setNotes(new HashMap<>(clientSession.getNotes()));

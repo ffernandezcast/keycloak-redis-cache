@@ -104,6 +104,7 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
       clientSessions =
           live.stream()
               .filter(this::filterAndRemoveExpiredClientSessions)
+              .filter(this::belongsToThisUserSession)
               .filter(this::matchingOfflineFlag)
               .filter(this::filterAndRemoveClientSessionWithoutClient)
               .collect(
@@ -114,27 +115,47 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
     return clientSessions;
   }
 
+  /**
+   * Hides a client session whose client (or realm) no longer resolves.
+   *
+   * <p>Despite the name this deliberately does <em>not</em> reap: the lookup goes to JPA, and under
+   * concurrent load a transient miss would delete a live client session, which {@code
+   * UserSessionConcurrencyTest} reproduces as a CAS storm. Hiding a session used to make it
+   * permanently undeletable, because every explicit delete path reads through this same filtered
+   * map; that hole is closed in {@link #removeAuthenticatedClientSessions(Collection)} instead,
+   * which falls back to the deterministic key (issue #81).
+   */
   private boolean filterAndRemoveClientSessionWithoutClient(
-      RedisAuthenticatedClientSessionAdapter redisAuthenticatedClientSessionAdapter) {
-    ClientModel client =
-        session
-            .clients()
-            .getClientById(
-                redisAuthenticatedClientSessionAdapter.getRealm(),
-                redisAuthenticatedClientSessionAdapter.getClientUuid());
-
-    return client != null;
+      RedisAuthenticatedClientSessionAdapter clientSession) {
+    RealmModel realm = clientSession.getRealm();
+    return realm != null
+        && session.clients().getClientById(realm, clientSession.getClientUuid()) != null;
   }
 
-  private boolean matchingOfflineFlag(
-      RedisAuthenticatedClientSessionAdapter redisAuthenticatedClientSessionAdapter) {
-    UserSessionModel clientUserSession = redisAuthenticatedClientSessionAdapter.getUserSession();
-    // A client session whose parent user session has expired/vanished is orphaned:
-    // getUserSession() returns null. Treat it as non-matching (filtered out) rather than
-    // dereferencing null (issue #78 review) — it cannot belong to this user session's view.
-    if (clientUserSession == null) return false;
+  private boolean belongsToThisUserSession(RedisAuthenticatedClientSessionAdapter clientSession) {
+    if (getId().equals(clientSession.getParentId())) return true;
+    // A member of authenticated-client:parent-index:<this> whose parentId points somewhere else is
+    // a stale or corrupt index entry, not one of our client sessions. Comparing parent ids is both
+    // exact and free; the offline-flag comparison below only caught this case by accident, through
+    // the null parent lookup of a dangling parentId (issue #78 review, issue #81).
+    log.warnf(
+        "Client session %s is indexed under user session %s but claims parent %s",
+        clientSession.getId(), getId(), clientSession.getParentId());
+    return false;
+  }
 
-    return isOffline() == clientUserSession.isOffline();
+  private boolean matchingOfflineFlag(RedisAuthenticatedClientSessionAdapter clientSession) {
+    // Prefer the flag stored on the client session: it costs no lookup and it still answers for an
+    // orphan, whose parent user session is by definition unreachable (issue #81). Only a hash
+    // written before that field existed needs the parent, and an orphan among those cannot belong
+    // to this user session's view.
+    Boolean clientSessionOffline = clientSession.isOffline();
+    if (clientSessionOffline == null) {
+      UserSessionModel parent = clientSession.getUserSession();
+      if (parent == null) return false;
+      clientSessionOffline = parent.isOffline();
+    }
+    return isOffline() == clientSessionOffline;
   }
 
   private boolean filterAndRemoveExpiredClientSessions(
@@ -365,17 +386,28 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
     Map<String, AuthenticatedClientSessionModel> acs = getAuthenticatedClientSessions();
     for (String clientUuid : removedClientUUIDS) {
       AuthenticatedClientSessionModel ac = acs.get(clientUuid);
-      if (ac != null) {
-        RedisAuthenticatedClientSessionAdapter a;
-        if (ac instanceof RedisAuthenticatedClientSessionAdapter) {
-          a = (RedisAuthenticatedClientSessionAdapter) ac;
-        } else {
-          a = clientSessionTrx.get(new AuthenticatedClientSessionKey(ac.getId()));
+      RedisAuthenticatedClientSessionAdapter a;
+      if (ac instanceof RedisAuthenticatedClientSessionAdapter) {
+        a = (RedisAuthenticatedClientSessionAdapter) ac;
+      } else if (ac != null) {
+        a = clientSessionTrx.get(new AuthenticatedClientSessionKey(ac.getId()));
+      } else {
+        // getAuthenticatedClientSessions() is filtered (expired / offline-flag mismatch / deleted
+        // client), so a client session that is very much alive in Redis can be invisible here.
+        // Deleting is the whole point of this call -- reporting a successful revoke while removing
+        // nothing is the worst outcome -- so fall back to the deterministic key (issue #81).
+        a =
+            clientSessionTrx.getIfPresent(
+                new AuthenticatedClientSessionKey(
+                    RedisAuthenticatedClientSessionAdapter.clientSessionId(getId(), clientUuid)));
+        if (a == null) {
+          log.warnf(
+              "No client session to remove for client %s on user session %s", clientUuid, getId());
         }
-        if (a != null) {
-          clientSessionTrx.addForDelete(a);
-          acs.remove(clientUuid);
-        }
+      }
+      if (a != null) {
+        clientSessionTrx.addForDelete(a);
+        acs.remove(clientUuid);
       }
     }
   }

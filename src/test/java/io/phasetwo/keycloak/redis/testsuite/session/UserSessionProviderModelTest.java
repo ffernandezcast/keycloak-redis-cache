@@ -22,6 +22,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.hasSize;
 import static org.junit.Assert.*;
 
+import io.phasetwo.keycloak.redis.connection.RedisConnectionProvider;
 import io.phasetwo.keycloak.redis.testsuite.KeycloakModelTest;
 import io.phasetwo.keycloak.redis.userSession.RedisAuthenticatedClientSessionAdapter;
 import java.util.*;
@@ -37,6 +38,7 @@ import org.keycloak.common.util.Time;
 import org.keycloak.models.*;
 import org.keycloak.models.utils.KeycloakModelUtils;
 import org.keycloak.protocol.oidc.OIDCLoginProtocol;
+import redis.clients.jedis.UnifiedJedis;
 
 @SuppressWarnings("deprecation")
 public class UserSessionProviderModelTest extends KeycloakModelTest {
@@ -132,14 +134,92 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
   }
 
   /**
-   * Regression for issue #81: {@code RedisAuthenticatedClientSessionAdapter.setTimestamp} must not
-   * throw an {@link NullPointerException} when the parent user session has expired/vanished and
-   * {@code getUserSession()} therefore returns {@code null} (e.g. a token refresh on an orphaned
-   * client session). An orphaned client session has no parent to tell us whether it was offline, so
-   * the expiration must still be computed (online-style) rather than failing the write.
+   * Builds a handle onto the client session stored under {@code <parentId>::<clientUuid>} without
+   * registering it with the client-session transaction. Deliberately goes through the adapter's own
+   * setters rather than a hand-written Redis hash, so the fixture survives a rename of the stored
+   * field names.
+   *
+   * <p>Because the client-session key is deterministic, a handle built this way addresses the same
+   * Redis hash as the one the provider would hand out — which is what lets the detach tests assert
+   * on Redis rather than on the in-memory {@code isMarkedForDelete()} flag of an instance nothing
+   * else can see.
+   */
+  private static RedisAuthenticatedClientSessionAdapter clientSessionReferring(
+      KeycloakSession session, String realmId, String parentId, String clientUuid) {
+    RedisAuthenticatedClientSessionAdapter clientSession =
+        new RedisAuthenticatedClientSessionAdapter(session, parentId + "::" + clientUuid);
+    clientSession.setRealmId(realmId);
+    clientSession.setParentId(parentId);
+    clientSession.setClientUuid(clientUuid);
+    return clientSession;
+  }
+
+  private static UnifiedJedis jedis(KeycloakSession session) {
+    return session.getProvider(RedisConnectionProvider.class).getJedis();
+  }
+
+  private static String clientSessionKey(String parentId, String clientUuid) {
+    return "authenticated-client:" + parentId + "::" + clientUuid;
+  }
+
+  private static String parentIndexKey(String parentId) {
+    return "authenticated-client:parent-index:" + parentId;
+  }
+
+  private static String clientIndexKey(String clientUuid) {
+    return "authenticated-client:client-index:" + clientUuid;
+  }
+
+  /**
+   * Regression for issue #81: {@code setTimestamp} must not throw when the parent user session has
+   * expired/vanished, and — crucially — must not <em>guess</em> the offline flag. The two
+   * expiration branches differ by up to 1440x (30 days offline vs. this realm's 500s client-session
+   * idle timeout), so guessing online for a genuine offline grant kills it within the hour. When
+   * the flag is unknowable and an expiration is already stored, the stored one must survive
+   * untouched.
    */
   @Test
-  public void testSetTimestampWithOrphanedParentDoesNotThrow() {
+  public void testSetTimestampWithUnknowableOfflineFlagPreservesTheStoredExpiration() {
+    final String parentId = KeycloakModelUtils.generateId(); // no such user session exists
+    final long storedExpiration = (Time.currentTimeMillis() + 9_999_000L);
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          ClientModel client = realm.getClientByClientId("test-app");
+
+          RedisAuthenticatedClientSessionAdapter orphan =
+              clientSessionReferring(session, realmId, parentId, client.getId());
+          orphan.setExpiration(storedExpiration);
+
+          int newTimestamp = Time.currentTime() + 60;
+          // Must not throw despite getUserSession() resolving to null.
+          orphan.setTimestamp(newTimestamp);
+
+          assertEquals(
+              "the timestamp write must still happen", newTimestamp, orphan.getTimestamp());
+          assertThat(
+              "the timestamp write must still be flushed",
+              orphan.getDirtyFields().keySet(),
+              hasItem("timestamp"));
+          assertEquals(
+              "an unknowable offline flag must preserve the stored expiration, not guess one",
+              Long.valueOf(storedExpiration),
+              orphan.getExpiration());
+          return null;
+        });
+  }
+
+  /**
+   * Companion to {@link #testSetTimestampWithUnknowableOfflineFlagPreservesTheStoredExpiration()}:
+   * preserving is only safe when there is something to preserve. Writing <em>no</em> expiration
+   * leaves a hash Redis never expires — {@code RedisHashCas} skips {@code PEXPIREAT} for a null
+   * expiration, {@code ExpirationUtils.isExpired} reports false for it, and one such member makes
+   * the read path {@code PERSIST} the shared client-index Set for every co-tenant. So with nothing
+   * stored, fall back to the shorter (online) horizon rather than emitting a TTL-less hash.
+   */
+  @Test
+  public void testSetTimestampWithUnknowableOfflineFlagNeverLeavesTheHashWithoutAnExpiration() {
     final String parentId = KeycloakModelUtils.generateId(); // no such user session exists
 
     inComittedTransaction(
@@ -147,91 +227,355 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
           RealmModel realm = session.realms().getRealm(realmId);
           ClientModel client = realm.getClientByClientId("test-app");
 
-          Map<String, String> orphanData = new HashMap<>();
-          orphanData.put("id", parentId + "::" + client.getId());
-          orphanData.put("parentId", parentId);
-          orphanData.put("realmId", realmId);
-          orphanData.put("clientUuid", client.getId());
-          orphanData.put("timestamp", String.valueOf(Time.currentTime()));
-          orphanData.put("offline", "false");
-
           RedisAuthenticatedClientSessionAdapter orphan =
-              new RedisAuthenticatedClientSessionAdapter(session, orphanData.get("id"), orphanData);
+              clientSessionReferring(session, realmId, parentId, client.getId());
+          assertNull("precondition: nothing stored to preserve", orphan.getExpiration());
 
-          // Must not throw despite getUserSession() resolving to null.
-          orphan.setTimestamp(Time.currentTime());
+          int newTimestamp = Time.currentTime();
+          orphan.setTimestamp(newTimestamp);
 
-          assertNotNull("an orphaned client session must still receive an expiration", orphan.getExpiration());
+          assertNotNull(
+              "a client session must never be written without an expiration",
+              orphan.getExpiration());
+          assertEquals(
+              "with nothing to preserve, fall back to the shorter online horizon",
+              Long.valueOf(newTimestamp * 1000L + 500_000L),
+              orphan.getExpiration());
           return null;
         });
   }
 
   /**
-   * Regression for issue #81: {@code RedisAuthenticatedClientSessionAdapter.setTimestamp} must not
-   * throw when the client is missing even though the parent user session still exists (a stale
-   * client session whose client was deleted). {@code getUserSession()} is non-null here, but
-   * {@code getClient()} resolves to {@code null}, and the offline expiration computation
-   * dereferences the client. The write must be skipped, not fail with a {@link
-   * NullPointerException}.
+   * Regression for issue #81: a client session must carry its own offline flag. Asking the parent
+   * user session for it fails exactly when it matters — the parent is the thing that vanished — and
+   * an offline grant that falls back to the online horizon dies 1440x early. With the flag stored
+   * on the client session, an orphan still computes the correct offline expiration.
    */
   @Test
-  public void testSetTimestampWithMissingClientDoesNotThrow() {
+  public void testSetTimestampOnAnOfflineOrphanKeepsTheOfflineHorizon() {
+    final String parentId = KeycloakModelUtils.generateId(); // no such user session exists
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          ClientModel client = realm.getClientByClientId("test-app");
+
+          RedisAuthenticatedClientSessionAdapter orphan =
+              clientSessionReferring(session, realmId, parentId, client.getId());
+          orphan.setOffline(true);
+
+          int newTimestamp = Time.currentTime();
+          orphan.setTimestamp(newTimestamp);
+
+          assertEquals(
+              "an offline client session must keep the offline idle horizon even when orphaned",
+              Long.valueOf(newTimestamp * 1000L + realm.getOfflineSessionIdleTimeout() * 1000L),
+              orphan.getExpiration());
+          return null;
+        });
+  }
+
+  /**
+   * Regression for issue #81: {@code setTimestamp} must not throw when the client is missing even
+   * though the parent user session still exists (a stale client session whose client was deleted).
+   * Both expiration branches dereference the client — but only to read per-client
+   * <em>overrides</em> of realm defaults, so a missing client means "no overrides", not "no
+   * expiration". Skipping the write entirely is what strands the hash without a TTL.
+   */
+  @Test
+  public void testSetTimestampWithMissingClientFallsBackToRealmDefaults() {
     final String missingClientUuid = KeycloakModelUtils.generateId(); // no such client exists
 
     inComittedTransaction(
         session -> {
-          RealmModel realm = session.realms().getRealm(realmId);
-          // A real, existing user session so getUserSession() resolves to non-null.
+          // A real, existing user session, so only the client is missing.
           UserSessionModel userSession = createSessions(session, realmId)[0];
 
-          Map<String, String> orphanData = new HashMap<>();
-          orphanData.put("id", userSession.getId() + "::" + missingClientUuid);
-          orphanData.put("parentId", userSession.getId());
-          orphanData.put("realmId", realmId);
-          orphanData.put("clientUuid", missingClientUuid);
-          orphanData.put("timestamp", String.valueOf(Time.currentTime()));
-          orphanData.put("offline", "false");
-
           RedisAuthenticatedClientSessionAdapter orphan =
-              new RedisAuthenticatedClientSessionAdapter(session, orphanData.get("id"), orphanData);
+              clientSessionReferring(session, realmId, userSession.getId(), missingClientUuid);
 
+          int newTimestamp = Time.currentTime();
           // Must not throw despite getClient() resolving to null.
-          orphan.setTimestamp(Time.currentTime());
+          orphan.setTimestamp(newTimestamp);
+
+          assertEquals(
+              "the timestamp write must still happen", newTimestamp, orphan.getTimestamp());
+          assertEquals(
+              "a missing client means no per-client overrides, so the realm defaults apply",
+              Long.valueOf(newTimestamp * 1000L + 500_000L),
+              orphan.getExpiration());
           return null;
         });
   }
 
   /**
-   * Regression for issue #81: {@code RedisAuthenticatedClientSessionAdapter.detachFromUserSession}
-   * must not throw when the parent user session is missing (an orphaned client session whose
-   * parent hash expired/vanished). It dereferences {@code getUserSession()} directly, which returns
-   * {@code null} for an orphan — the same defect fixed in {@code setTimestamp} (#83). A revoke or
-   * logout on an orphaned client session must not NPE.
+   * Regression for issue #81: the guards added for a missing parent and a missing client are both
+   * unreachable when the <em>realm</em> is the thing that is gone. {@code getClient()} is {@code
+   * getRealm().getClientById(..)} and {@code getRealm()} returns {@code null} for a realm that no
+   * longer resolves, so the NPE fires one frame earlier than the guard that is supposed to stop it
+   * — and {@code getUserSession()} hits {@code Objects.requireNonNull(realm)} inside the provider.
    */
   @Test
-  public void testDetachFromUserSessionWithOrphanedParentDoesNotThrow() {
-    final String parentId = KeycloakModelUtils.generateId(); // no such user session exists
+  public void testAnUnresolvableRealmDoesNotThrowFromTimestampOrDetach() {
+    final String goneRealmId = KeycloakModelUtils.generateId(); // no such realm exists
+    final String parentId = KeycloakModelUtils.generateId();
+    final String clientUuid = KeycloakModelUtils.generateId();
+
+    inComittedTransaction(
+        session -> {
+          RedisAuthenticatedClientSessionAdapter stranded =
+              clientSessionReferring(session, goneRealmId, parentId, clientUuid);
+
+          assertNull("precondition: the realm must not resolve", stranded.getRealm());
+          assertNull("getClient() must not dereference a null realm", stranded.getClient());
+          assertNull(
+              "getUserSession() must not dereference a null realm", stranded.getUserSession());
+
+          int newTimestamp = Time.currentTime();
+          stranded.setTimestamp(newTimestamp);
+          assertEquals(
+              "the timestamp write must still happen", newTimestamp, stranded.getTimestamp());
+
+          stranded.detachFromUserSession();
+          return null;
+        });
+  }
+
+  /**
+   * Regression for issue #81: {@code getUserSession()} must resolve <em>this</em> client session's
+   * parent, not the offline sibling of a vanished online parent.
+   *
+   * <p>{@code getOfflineUserSession(realm, id)} falls back to {@code
+   * user-session:corresponding-session-index:<id>}, which is keyed on the <em>online</em> session
+   * id. That alias is right for a caller asking "give me the offline session for this login" and
+   * wrong here: accepting it makes an orphan look attached, so the orphan guard never fires and
+   * detach revokes the sibling's client session instead.
+   */
+  @Test
+  public void testGetUserSessionDoesNotResolveTheOfflineSiblingOfAVanishedParent() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    // createSessions() commits in a nested transaction, so the online session has to be re-read
+    // here before it can father an offline sibling.
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          session
+              .sessions()
+              .createOfflineUserSession(session.sessions().getUserSession(realm, ids[0]));
+        });
+
+    // The online parent's hash TTL-expires; its offline sibling and the corresponding-session
+    // index both survive.
+    inComittedTransaction(
+        session -> {
+          jedis(session).del("user-session:" + ids[0]);
+        });
+
+    inComittedTransaction(
+        session -> {
+          RedisAuthenticatedClientSessionAdapter orphan =
+              clientSessionReferring(session, realmId, ids[0], ids[1]);
+
+          assertNull(
+              "an orphan must not adopt the offline sibling of its vanished parent",
+              orphan.getUserSession());
+          return null;
+        });
+  }
+
+  /**
+   * Regression for issue #81: {@code detachFromUserSession} is the revocation primitive behind
+   * refresh-token reuse, authorization-code replay and offline-token revoke. Returning silently for
+   * an orphan reports a successful revoke while leaving the hash, its {@code
+   * refreshToken:<reuseId>} fields and both secondary-index memberships live in Redis — and nothing
+   * else reaps a client session whose parent is gone ({@code removeAllExpired} is a log-only
+   * no-op). The orphan must be deleted from Redis.
+   */
+  @Test
+  public void testDetachFromUserSessionWithOrphanedParentReapsItFromRedis() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              UserSessionModel userSession = createSessions(session, realmId)[0];
+              return new String[] {
+                userSession.getId(), realm.getClientByClientId("test-app").getId()
+              };
+            });
+    final String parentId = ids[0];
+    final String clientUuid = ids[1];
+
+    inComittedTransaction(
+        session -> {
+          assertTrue(
+              "precondition: the client session hash exists",
+              jedis(session).exists(clientSessionKey(parentId, clientUuid)));
+          // The parent user session's hash TTL-expires, orphaning its client sessions.
+          jedis(session).del("user-session:" + parentId);
+        });
+
+    inComittedTransaction(
+        session -> {
+          RedisAuthenticatedClientSessionAdapter orphan =
+              clientSessionReferring(session, realmId, parentId, clientUuid);
+          // Must not throw despite getUserSession() resolving to null.
+          orphan.detachFromUserSession();
+        });
+
+    inComittedTransaction(
+        session -> {
+          UnifiedJedis jedis = jedis(session);
+          assertFalse(
+              "detaching an orphan must delete its hash, not report a successful revoke while"
+                  + " leaving it live in Redis",
+              jedis.exists(clientSessionKey(parentId, clientUuid)));
+          assertThat(
+              "detaching an orphan must drop it from the parent index",
+              jedis.smembers(parentIndexKey(parentId)),
+              not(hasItem(clientSessionKey(parentId, clientUuid))));
+          assertThat(
+              "detaching an orphan must drop it from the client index",
+              jedis.smembers(clientIndexKey(clientUuid)),
+              not(hasItem(clientSessionKey(parentId, clientUuid))));
+        });
+  }
+
+  /**
+   * The positive path of {@link #testDetachFromUserSessionWithOrphanedParentReapsItFromRedis()}: an
+   * attached client session must also actually leave Redis, which the pre-existing {@code
+   * isMarkedForDelete()}-style assertions could not observe.
+   */
+  @Test
+  public void testDetachFromUserSessionRemovesAnAttachedClientSessionFromRedis() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              UserSessionModel userSession = createSessions(session, realmId)[0];
+              return new String[] {
+                userSession.getId(), realm.getClientByClientId("test-app").getId()
+              };
+            });
 
     inComittedTransaction(
         session -> {
           RealmModel realm = session.realms().getRealm(realmId);
-          ClientModel client = realm.getClientByClientId("test-app");
+          UserSessionModel userSession = session.sessions().getUserSession(realm, ids[0]);
+          userSession.getAuthenticatedClientSessions().get(ids[1]).detachFromUserSession();
+        });
 
-          Map<String, String> orphanData = new HashMap<>();
-          orphanData.put("id", parentId + "::" + client.getId());
-          orphanData.put("parentId", parentId);
-          orphanData.put("realmId", realmId);
-          orphanData.put("clientUuid", client.getId());
-          orphanData.put("timestamp", String.valueOf(Time.currentTime()));
-          orphanData.put("offline", "false");
+    inComittedTransaction(
+        session -> {
+          assertFalse(
+              "detaching an attached client session must delete its hash",
+              jedis(session).exists(clientSessionKey(ids[0], ids[1])));
+        });
+  }
 
-          RedisAuthenticatedClientSessionAdapter orphan =
-              new RedisAuthenticatedClientSessionAdapter(session, orphanData.get("id"), orphanData);
+  /**
+   * Regression for issue #81: {@code removeAuthenticatedClientSessions} reads through the
+   * triple-filtered client-session map (expired / offline-flag mismatch / deleted client), so a
+   * client session that is very much alive in Redis can be invisible to the only code path that
+   * deletes it. Revoking then reports success and removes nothing. Deleting a client that still has
+   * a live client session is the cheapest way to reach that filter.
+   */
+  @Test
+  public void testRemoveAuthenticatedClientSessionsDeletesASessionHiddenByTheClientFilter() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              UserSessionModel userSession = createSessions(session, realmId)[0];
+              return new String[] {
+                userSession.getId(), realm.getClientByClientId("third-party").getId()
+              };
+            });
 
-          // Must not throw despite getUserSession() resolving to null.
-          orphan.detachFromUserSession();
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          realm.removeClient(ids[1]);
+        });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel userSession = session.sessions().getUserSession(realm, ids[0]);
+          userSession.removeAuthenticatedClientSessions(Collections.singleton(ids[1]));
+        });
+
+    inComittedTransaction(
+        session -> {
+          assertFalse(
+              "a revoke must delete the client session even when the read filters hide it",
+              jedis(session).exists(clientSessionKey(ids[0], ids[1])));
+        });
+  }
+
+  /**
+   * Client-session expiration must only use the remember-me lifespans when the session actually is
+   * remember-me. {@code setUserSessionExpiration} checks the flag; {@code
+   * setClientSessionExpiration} does not, so on a realm with remember-me timeouts configured every
+   * client session — remember-me or not — outlives its parent user session and becomes exactly the
+   * orphan issue #81 is patching around.
+   */
+  @Test
+  public void testClientSessionExpirationIgnoresRememberMeLifespansWhenNotRememberMe() {
+    final int ssoIdle = 1800;
+    final int ssoIdleRememberMe = 864000;
+
+    withRealm(
+        realmId,
+        (s, realm) -> {
+          realm.setSsoSessionIdleTimeoutRememberMe(ssoIdleRememberMe);
+          realm.setClientSessionIdleTimeout(0); // do not let the min() mask the choice
           return null;
         });
+
+    try {
+      inComittedTransaction(
+          session -> {
+            RealmModel realm = session.realms().getRealm(realmId);
+            ClientModel client = realm.getClientByClientId("test-app");
+            UserSessionModel userSession =
+                session
+                    .sessions()
+                    .createUserSession(
+                        realm,
+                        session.users().getUserByUsername(realm, "user1"),
+                        "user1",
+                        "127.0.0.1",
+                        "form",
+                        false, // NOT remember-me
+                        null,
+                        null);
+            AuthenticatedClientSessionModel clientSession =
+                session.sessions().createClientSession(realm, client, userSession);
+
+            assertEquals(
+                "a non-remember-me client session must use the normal SSO idle timeout",
+                Long.valueOf(clientSession.getTimestamp() * 1000L + ssoIdle * 1000L),
+                ((RedisAuthenticatedClientSessionAdapter) clientSession).getExpiration());
+            return null;
+          });
+    } finally {
+      withRealm(
+          realmId,
+          (s, realm) -> {
+            realm.setSsoSessionIdleTimeoutRememberMe(0);
+            realm.setClientSessionIdleTimeout(500);
+            return null;
+          });
+    }
   }
 
   @Test
@@ -989,11 +1333,13 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
                   return transientSession.isOffline();
                 }
 
-                public Map<String, AuthenticatedClientSessionModel> getAuthenticatedClientSessions() {
+                public Map<String, AuthenticatedClientSessionModel>
+                    getAuthenticatedClientSessions() {
                   return transientSession.getAuthenticatedClientSessions();
                 }
 
-                public void removeAuthenticatedClientSessions(Collection<String> removedClientUUIDS) {
+                public void removeAuthenticatedClientSessions(
+                    Collection<String> removedClientUUIDS) {
                   transientSession.removeAuthenticatedClientSessions(removedClientUUIDS);
                 }
 
