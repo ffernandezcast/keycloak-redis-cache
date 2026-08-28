@@ -297,8 +297,12 @@ public abstract class RedisChangelogTransaction<K extends Key, A extends MapEnti
     A superseded = toDelete.remove(k);
     if (superseded == null || superseded == replacement) return;
     replacement.setVersion(superseded.getVersion());
+    Map<String, String> alreadySet = replacement.getFieldSnapshot();
     for (String field : superseded.getFieldSnapshot().keySet()) {
-      if (!"version".equals(field)) {
+      // Never clear what the replacement already carries -- an adapter writes its own id in its
+      // constructor, so clearing it here would leave a hash with no id at all. Anything the caller
+      // sets after this point un-deletes itself via setField.
+      if (!"version".equals(field) && !alreadySet.containsKey(field)) {
         replacement.removeField(field);
       }
     }

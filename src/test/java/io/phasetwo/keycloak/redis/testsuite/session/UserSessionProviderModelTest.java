@@ -524,6 +524,40 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
         });
   }
 
+  /**
+   * Replacing a client session must not wipe the fields the fresh instance sets before it is handed
+   * to the caller. The adapter writes its own {@code id} in its constructor, so a replace that
+   * marks every predecessor field deleted would drop it — leaving a hash whose {@code getId()} is
+   * null.
+   */
+  @Test
+  public void testRecreatingAClientSessionKeepsItsIdField() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel userSession = session.sessions().getUserSession(realm, ids[0]);
+          session.sessions().createClientSession(realm, realm.getClientById(ids[1]), userSession);
+        });
+
+    inComittedTransaction(
+        session -> {
+          assertEquals(
+              "the re-created client session must keep its id",
+              ids[0] + "::" + ids[1],
+              jedis(session).hget(clientSessionKey(ids[0], ids[1]), "id"));
+        });
+  }
+
   /** The offline twin of {@link #testRecreatingAnOnlineClientSessionKeepsIt()}. */
   @Test
   public void testRecreatingAnOfflineClientSessionKeepsIt() {
