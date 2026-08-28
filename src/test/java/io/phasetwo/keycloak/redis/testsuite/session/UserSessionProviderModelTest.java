@@ -413,6 +413,117 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
         });
   }
 
+  /**
+   * Re-creating a client session must replace it, not merge into it.
+   *
+   * <p>Writes are partial ({@code hsetex} of the dirty fields under a CAS version), and a version
+   * mismatch rebases onto whatever is currently in Redis. So a "new" client session written over
+   * the key of the one it replaced inherits every field the caller did not explicitly set —
+   * including the predecessor's {@code refreshToken:<reuseId>}, which leaves a revoked token
+   * resolvable on the successor session.
+   */
+  @Test
+  public void testRecreatingAClientSessionDoesNotInheritThePredecessorsRefreshToken() {
+    final String reuseId = "reuse-1";
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel userSession = session.sessions().getUserSession(realm, ids[0]);
+          userSession
+              .getAuthenticatedClientSessions()
+              .get(ids[1])
+              .setRefreshToken(reuseId, "the-old-token");
+        });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel userSession = session.sessions().getUserSession(realm, ids[0]);
+          session.sessions().createClientSession(realm, realm.getClientById(ids[1]), userSession);
+        });
+
+    inComittedTransaction(
+        session -> {
+          assertNull(
+              "a re-created client session must not inherit the predecessor's refresh token",
+              jedis(session).hget(clientSessionKey(ids[0], ids[1]), "refreshToken:" + reuseId));
+        });
+  }
+
+  /**
+   * The offline twin of {@link
+   * #testRecreatingAClientSessionDoesNotInheritThePredecessorsRefreshToken()}: re-issuing an
+   * offline token must not leave the previous offline refresh token resolvable on the successor
+   * session.
+   */
+  @Test
+  public void testRecreatingAnOfflineClientSessionDoesNotInheritTheRefreshToken() {
+    final String reuseId = "reuse-1";
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    String offlineUserSessionId =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              UserSessionModel online = session.sessions().getUserSession(realm, ids[0]);
+              UserSessionModel offline = session.sessions().createOfflineUserSession(online);
+              session
+                  .sessions()
+                  .createOfflineClientSession(
+                      online.getAuthenticatedClientSessions().get(ids[1]), offline);
+              return offline.getId();
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          session
+              .sessions()
+              .getOfflineUserSession(realm, offlineUserSessionId)
+              .getAuthenticatedClientSessions()
+              .get(ids[1])
+              .setRefreshToken(reuseId, "the-old-offline-token");
+        });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel online = session.sessions().getUserSession(realm, ids[0]);
+          UserSessionModel offline =
+              session.sessions().getOfflineUserSession(realm, offlineUserSessionId);
+          session
+              .sessions()
+              .createOfflineClientSession(
+                  online.getAuthenticatedClientSessions().get(ids[1]), offline);
+        });
+
+    inComittedTransaction(
+        session -> {
+          assertNull(
+              "re-issuing an offline token must not carry the previous refresh token over",
+              jedis(session)
+                  .hget(clientSessionKey(offlineUserSessionId, ids[1]), "refreshToken:" + reuseId));
+        });
+  }
+
   /** The offline twin of {@link #testRecreatingAnOnlineClientSessionKeepsIt()}. */
   @Test
   public void testRecreatingAnOfflineClientSessionKeepsIt() {

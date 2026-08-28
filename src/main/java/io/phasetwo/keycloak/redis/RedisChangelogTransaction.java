@@ -183,12 +183,7 @@ public abstract class RedisChangelogTransaction<K extends Key, A extends MapEnti
     if (model == null) {
       model = adapterSupplier.newInstance(k);
       cache.put(k, model);
-      // Creating at a key that is pending deletion supersedes that deletion: the caller is
-      // replacing the entity, not removing it. Entity keys are deterministic, so "remove the old
-      // one, then create the new one" lands on the same key -- and commitImpl deletes any cached
-      // model whose key is in toDelete, in preference to writing it, so without this the entity
-      // the caller was just handed would silently never reach Redis (issue #81).
-      toDelete.remove(k);
+      supersedePendingDelete(k, model);
     }
     return model;
   }
@@ -279,9 +274,34 @@ public abstract class RedisChangelogTransaction<K extends Key, A extends MapEnti
 
   public void addForSave(A model) {
     cache.put(model.getKey(), model);
-    // An explicit save supersedes a deletion registered earlier in this same transaction, for the
-    // same reason as in get(): the caller is replacing, not removing (issue #81).
-    toDelete.remove(model.getKey());
+    supersedePendingDelete(model.getKey(), model);
+  }
+
+  /**
+   * Lets a create/save at {@code k} supersede a deletion already registered for that key, as a
+   * genuine <em>replace</em>.
+   *
+   * <p>Entity keys are deterministic, so "remove the old one, then create the new one" lands on the
+   * same key. Without this, {@link #commitImpl()} deletes any cached model whose key is in {@code
+   * toDelete} in preference to writing it, and the entity the caller was just handed silently never
+   * reaches Redis (issue #81).
+   *
+   * <p>Cancelling the delete alone would not be enough. Writes are partial — {@code hsetex} of the
+   * dirty fields under a CAS version — and a version mismatch rebases onto whatever is currently in
+   * Redis, so the successor would inherit every field the caller does not set, including the
+   * predecessor's refresh tokens. Adopting the predecessor's version and marking its fields deleted
+   * makes the write replace the hash rather than merge into it; any field the caller does set is
+   * un-deleted by {@code setField}.
+   */
+  private void supersedePendingDelete(K k, A replacement) {
+    A superseded = toDelete.remove(k);
+    if (superseded == null || superseded == replacement) return;
+    replacement.setVersion(superseded.getVersion());
+    for (String field : superseded.getFieldSnapshot().keySet()) {
+      if (!"version".equals(field)) {
+        replacement.removeField(field);
+      }
+    }
   }
 
   public void addForDelete(A model) {

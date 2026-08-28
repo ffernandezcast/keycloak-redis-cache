@@ -679,6 +679,23 @@ public class RedisUserSessionProvider implements UserSessionProvider {
         "createOfflineClientSession(%s, %s)%s",
         clientSession, offlineUserSession, getShortStackTrace());
 
+    RealmModel realm = clientSession.getRealm();
+    Optional<RedisUserSessionAdapter> userSessionEntity =
+        getOfflineUserSessionEntityStream(realm, offlineUserSession.getId()).findFirst();
+    if (userSessionEntity.isEmpty()) {
+      return null;
+    }
+    RedisUserSessionAdapter userSession = userSessionEntity.get();
+    String clientId = clientSession.getClient().getId();
+
+    // Remove the predecessor BEFORE creating the replacement, as the online path does. Keyed on the
+    // client UUID, not the client-session id. The replacement lands on the same deterministic key,
+    // and creating over a pending delete replaces the hash rather than merging into it -- so the
+    // successor cannot inherit the predecessor's refresh tokens (issue #81).
+    if (userSession.getAuthenticatedClientSessionByClient(clientId) != null) {
+      userSession.removeAuthenticatedClientSessions(List.of(clientId));
+    }
+
     RedisAuthenticatedClientSessionAdapter clientSessionEntity =
         createAuthenticatedClientSessionInstance(clientSession, offlineUserSession);
     int currentTime = Time.currentTime();
@@ -688,29 +705,14 @@ public class RedisUserSessionProvider implements UserSessionProvider {
         AuthenticatedClientSessionModel.USER_SESSION_STARTED_AT_NOTE,
         String.valueOf(offlineUserSession.getStarted()));
     clientSessionEntity.setTimestamp(currentTime);
-    RealmModel realm = clientSession.getRealm();
     setClientSessionExpiration(
         clientSessionEntity,
         SessionExpirationData.builder().realm(realm).build(),
         clientSession.getClient(),
         true);
 
-    Optional<RedisUserSessionAdapter> userSessionEntity =
-        getOfflineUserSessionEntityStream(realm, offlineUserSession.getId()).findFirst();
-    if (userSessionEntity.isPresent()) {
-      RedisUserSessionAdapter userSession = userSessionEntity.get();
-      String clientId = clientSession.getClient().getId();
-      if (userSession.getAuthenticatedClientSessionByClient(clientId) != null) {
-        // Keyed on the client UUID, not the client-session id -- compare the online path above.
-        userSession.removeAuthenticatedClientSessions(List.of(clientId));
-      }
-
-      userSession.addAuthenticatedClientSession(clientSessionEntity);
-
-      return clientSessionEntity;
-    }
-
-    return null;
+    userSession.addAuthenticatedClientSession(clientSessionEntity);
+    return clientSessionEntity;
   }
 
   // xx
