@@ -183,6 +183,12 @@ public abstract class RedisChangelogTransaction<K extends Key, A extends MapEnti
     if (model == null) {
       model = adapterSupplier.newInstance(k);
       cache.put(k, model);
+      // Creating at a key that is pending deletion supersedes that deletion: the caller is
+      // replacing the entity, not removing it. Entity keys are deterministic, so "remove the old
+      // one, then create the new one" lands on the same key -- and commitImpl deletes any cached
+      // model whose key is in toDelete, in preference to writing it, so without this the entity
+      // the caller was just handed would silently never reach Redis (issue #81).
+      toDelete.remove(k);
     }
     return model;
   }
@@ -273,6 +279,9 @@ public abstract class RedisChangelogTransaction<K extends Key, A extends MapEnti
 
   public void addForSave(A model) {
     cache.put(model.getKey(), model);
+    // An explicit save supersedes a deletion registered earlier in this same transaction, for the
+    // same reason as in get(): the caller is replacing, not removing (issue #81).
+    toDelete.remove(model.getKey());
   }
 
   public void addForDelete(A model) {

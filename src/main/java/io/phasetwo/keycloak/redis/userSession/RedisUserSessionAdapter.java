@@ -106,7 +106,7 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
               .filter(this::filterAndRemoveExpiredClientSessions)
               .filter(this::belongsToThisUserSession)
               .filter(this::matchingOfflineFlag)
-              .filter(this::filterAndRemoveClientSessionWithoutClient)
+              .filter(this::hasResolvableClient)
               .collect(
                   Collectors.toMap(
                       RedisAuthenticatedClientSessionAdapter::getClientUuid,
@@ -116,7 +116,7 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
   }
 
   /**
-   * Hides a client session whose client (or realm) no longer resolves.
+   * Whether this client session's client (and realm) still resolve.
    *
    * <p>Despite the name this deliberately does <em>not</em> reap: the lookup goes to JPA, and under
    * concurrent load a transient miss would delete a live client session, which {@code
@@ -125,8 +125,7 @@ public class RedisUserSessionAdapter extends MapEntity<UserSessionKey>
    * map; that hole is closed in {@link #removeAuthenticatedClientSessions(Collection)} instead,
    * which falls back to the deterministic key (issue #81).
    */
-  private boolean filterAndRemoveClientSessionWithoutClient(
-      RedisAuthenticatedClientSessionAdapter clientSession) {
+  private boolean hasResolvableClient(RedisAuthenticatedClientSessionAdapter clientSession) {
     RealmModel realm = clientSession.getRealm();
     return realm != null
         && session.clients().getClientById(realm, clientSession.getClientUuid()) != null;

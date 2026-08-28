@@ -378,6 +378,138 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
   }
 
   /**
+   * Re-issuing a client session for a client that already has one must replace it, not delete it.
+   *
+   * <p>Client-session ids are deterministic, so the "replacement" is the same Redis key as the
+   * predecessor. Both create paths remove the predecessor first, which puts that key in the
+   * transaction's {@code toDelete} map — and {@code commitImpl} deletes any cached model whose key
+   * is in {@code toDelete}, in preference to writing it. The session the caller was just handed
+   * then silently never reaches Redis.
+   */
+  @Test
+  public void testRecreatingAnOnlineClientSessionKeepsIt() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel userSession = session.sessions().getUserSession(realm, ids[0]);
+          session.sessions().createClientSession(realm, realm.getClientById(ids[1]), userSession);
+        });
+
+    inComittedTransaction(
+        session -> {
+          assertTrue(
+              "re-creating a client session must replace it, not delete it",
+              jedis(session).exists(clientSessionKey(ids[0], ids[1])));
+        });
+  }
+
+  /** The offline twin of {@link #testRecreatingAnOnlineClientSessionKeepsIt()}. */
+  @Test
+  public void testRecreatingAnOfflineClientSessionKeepsIt() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    String offlineUserSessionId =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              UserSessionModel online = session.sessions().getUserSession(realm, ids[0]);
+              UserSessionModel offline = session.sessions().createOfflineUserSession(online);
+              session
+                  .sessions()
+                  .createOfflineClientSession(
+                      online.getAuthenticatedClientSessions().get(ids[1]), offline);
+              return offline.getId();
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel online = session.sessions().getUserSession(realm, ids[0]);
+          UserSessionModel offline =
+              session.sessions().getOfflineUserSession(realm, offlineUserSessionId);
+          session
+              .sessions()
+              .createOfflineClientSession(
+                  online.getAuthenticatedClientSessions().get(ids[1]), offline);
+        });
+
+    inComittedTransaction(
+        session -> {
+          assertTrue(
+              "re-issuing an offline token must replace the offline client session, not delete it",
+              jedis(session).exists(clientSessionKey(offlineUserSessionId, ids[1])));
+        });
+  }
+
+  /**
+   * A client session hash written before the offline flag was persisted must backfill it the first
+   * time it is written, while its parent user session is still reachable. Otherwise every
+   * pre-upgrade session keeps depending on a parent that may be gone next time, and the orphan bug
+   * survives the fix for as long as those sessions live — up to the 30-day offline horizon.
+   */
+  @Test
+  public void testSetTimestampBackfillsTheOfflineFlagFromTheParent() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    String offlineUserSessionId =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return session
+                  .sessions()
+                  .createOfflineUserSession(session.sessions().getUserSession(realm, ids[0]))
+                  .getId();
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          RedisAuthenticatedClientSessionAdapter legacy =
+              clientSessionReferring(session, realmId, offlineUserSessionId, ids[1]);
+          assertNull("precondition: a legacy hash carries no offline flag", legacy.isOffline());
+
+          int newTimestamp = Time.currentTime();
+          legacy.setTimestamp(newTimestamp);
+
+          assertEquals(
+              "the offline flag must be backfilled from the parent while it is still reachable",
+              Boolean.TRUE,
+              legacy.isOffline());
+          assertEquals(
+              "and the offline horizon must be used, not the online one",
+              Long.valueOf(newTimestamp * 1000L + realm.getOfflineSessionIdleTimeout() * 1000L),
+              legacy.getExpiration());
+          return null;
+        });
+  }
+
+  /**
    * Regression for issue #81: {@code getUserSession()} must resolve <em>this</em> client session's
    * parent, not the offline sibling of a vanished online parent.
    *

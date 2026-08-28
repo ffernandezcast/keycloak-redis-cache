@@ -210,7 +210,13 @@ public class RedisAuthenticatedClientSessionAdapter extends MapEntity<Authentica
       return offline;
     }
     UserSessionModel parent = getUserSession();
-    return parent == null ? null : parent.isOffline();
+    if (parent == null) {
+      return null;
+    }
+    // Backfill while the parent is still reachable, so a hash written before the flag existed stops
+    // depending on it. Safe here because setTimestamp is already a write (issue #81).
+    setOffline(parent.isOffline());
+    return parent.isOffline();
   }
 
   @Override
