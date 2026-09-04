@@ -137,24 +137,6 @@ public class RedisUserSessionProvider implements UserSessionProvider {
     return getUserSessionById(userSession.getId());
   }
 
-  /**
-   * Convert the AuthenticatedClientSessionModel to a RedisAuthenticatedClientSessionAdapter or load
-   * it from the transaction
-   */
-  private RedisAuthenticatedClientSessionAdapter getAuthenticatedClientSessionAdapter(
-      AuthenticatedClientSessionModel authenticatedClientSession) {
-    RedisAuthenticatedClientSessionAdapter authenticatedClientSessionEntity;
-    if (authenticatedClientSession instanceof RedisAuthenticatedClientSessionAdapter) {
-      authenticatedClientSessionEntity =
-          (RedisAuthenticatedClientSessionAdapter) authenticatedClientSession;
-    } else {
-      authenticatedClientSessionEntity =
-          clientSessionTrx.get(
-              new AuthenticatedClientSessionKey(authenticatedClientSession.getId()));
-    }
-    return authenticatedClientSessionEntity;
-  }
-
   // xx
   @Override
   public AuthenticatedClientSessionModel getClientSession(
