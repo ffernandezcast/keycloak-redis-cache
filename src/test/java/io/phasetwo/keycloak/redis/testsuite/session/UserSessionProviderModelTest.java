@@ -706,6 +706,133 @@ public class UserSessionProviderModelTest extends KeycloakModelTest {
   }
 
   /**
+   * The online mirror of {@link #testSetTimestampBackfillsTheOfflineFlagFromTheParent()}, and the
+   * direction with no guard of its own: a legacy hash whose online parent is still alive <em>and
+   * has an offline sibling</em> must backfill {@code false}.
+   *
+   * <p>Two things keep this correct, and either one alone is enough: {@code getUserSession()} tries
+   * the online lookup first, and it exact-matches the parent id on the offline fallback — whose
+   * corresponding-session-index alias otherwise hands back the sibling. Verified by probe: drop
+   * both and this test fails with {@code expected:<false> but was:<true>}; drop either one and it
+   * still passes. It is the redundancy that is being pinned here, because the backfill persists
+   * whatever it decides, so a wrong answer is permanent for the life of the grant (issue #81).
+   */
+  @Test
+  public void testSetTimestampBackfillsOnlineWhenTheLiveParentHasAnOfflineSibling() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId()
+              };
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          session
+              .sessions()
+              .createOfflineUserSession(session.sessions().getUserSession(realm, ids[0]));
+        });
+
+    // Age the hash back to before the offline flag existed.
+    inComittedTransaction(
+        session -> {
+          jedis(session).hdel(clientSessionKey(ids[0], ids[1]), "offline");
+        });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+          UserSessionModel sibling = session.sessions().getOfflineUserSession(realm, ids[0]);
+          assertNotNull("precondition: the online parent has an offline sibling", sibling);
+          assertNotEquals(
+              "precondition: the sibling is a different user session", ids[0], sibling.getId());
+
+          RedisAuthenticatedClientSessionAdapter legacy =
+              clientSessionReferring(session, realmId, ids[0], ids[1]);
+          assertNull("precondition: a legacy hash carries no offline flag", legacy.isOffline());
+
+          int newTimestamp = Time.currentTime();
+          legacy.setTimestamp(newTimestamp);
+
+          assertEquals(
+              "a live online parent must backfill false, not the offline sibling's true",
+              Boolean.FALSE,
+              legacy.isOffline());
+          assertEquals(
+              "and the online horizon must be used, not the offline one",
+              Long.valueOf(newTimestamp * 1000L + realm.getClientSessionIdleTimeout() * 1000L),
+              legacy.getExpiration());
+          return null;
+        });
+  }
+
+  /**
+   * Answers the review question on #86: promoting one client to offline must not drag the user's
+   * other client sessions offline with it.
+   *
+   * <p>{@code offline} is a partition flag, not an entitlement — the {@code offline_access} check
+   * lives in {@code UserSessionManager.isOfflineTokenAllowed}, two layers above this provider. What
+   * this test pins is the structural consequence: {@code createOfflineUserSession} copies no client
+   * sessions at all, and {@code createOfflineClientSession} adds exactly the one client it is
+   * handed, so a client that never requested offline access keeps both its online client session
+   * and its online flag.
+   */
+  @Test
+  public void testPromotingOneClientToOfflineLeavesTheOtherClientOnline() {
+    String[] ids =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              return new String[] {
+                createSessions(session, realmId)[0].getId(),
+                realm.getClientByClientId("test-app").getId(),
+                realm.getClientByClientId("third-party").getId()
+              };
+            });
+
+    String offlineUserSessionId =
+        inComittedTransaction(
+            session -> {
+              RealmModel realm = session.realms().getRealm(realmId);
+              UserSessionModel online = session.sessions().getUserSession(realm, ids[0]);
+              UserSessionModel offline = session.sessions().createOfflineUserSession(online);
+              session
+                  .sessions()
+                  .createOfflineClientSession(
+                      online.getAuthenticatedClientSessions().get(ids[1]), offline);
+              return offline.getId();
+            });
+
+    inComittedTransaction(
+        session -> {
+          RealmModel realm = session.realms().getRealm(realmId);
+
+          assertEquals(
+              "only the client that requested offline access belongs to the offline session",
+              Set.of(ids[1]),
+              session
+                  .sessions()
+                  .getOfflineUserSession(realm, offlineUserSessionId)
+                  .getAuthenticatedClientSessions()
+                  .keySet());
+
+          assertEquals(
+              "the promoted client session is stored offline",
+              "true",
+              jedis(session).hget(clientSessionKey(offlineUserSessionId, ids[1]), "offline"));
+          assertEquals(
+              "the other client keeps its online client session, still flagged online",
+              "false",
+              jedis(session).hget(clientSessionKey(ids[0], ids[2]), "offline"));
+          return null;
+        });
+  }
+
+  /**
    * Regression for issue #81: {@code detachFromUserSession} is the revocation primitive behind
    * refresh-token reuse, authorization-code replay and offline-token revoke. Returning silently for
    * an orphan reports a successful revoke while leaving the hash, its {@code
